@@ -47,6 +47,11 @@
 #define MAX_ACTIVE_SESSIONS 256
 #define LAST_ERROR_MAX 512
 
+#ifndef RELAY_VERSION
+#define RELAY_VERSION "dev"
+#endif
+
+static const char *RELAY_VERSION_STRING = RELAY_VERSION;
 static const int RETRY_DELAYS_MS[] = {1000, 2000, 4000, 8000, 16000};
 
 typedef struct relay_stream_state {
@@ -863,10 +868,18 @@ static int resolve_output(const char *host, int port, relay_config_t *cfg)
 
 int main(int argc, char *argv[])
 {
+    if (argc == 2 &&
+        (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+        puts(RELAY_VERSION_STRING);
+        return 0;
+    }
+
     if (argc != 2 && argc != 3) {
         fprintf(stderr,
-                "Usage: %s <config.json>\n"
+                "Usage: %s [--version]\n"
+                "   or: %s <config.json>\n"
                 "   or: %s <srt-input-uri> <output-uri>\n",
+                argv[0],
                 argv[0],
                 argv[0]);
         return 1;

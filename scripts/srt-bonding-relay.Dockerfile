@@ -1,6 +1,7 @@
 FROM ubuntu:22.04
 
 ARG SRT_TAG=v1.5.5
+ARG RELAY_VERSION=dev
 
 RUN apt-get update -q \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
@@ -25,7 +26,7 @@ WORKDIR /src/app
 ARG RELAY_SOURCE_SHA=dev
 RUN printf '%s\n' "$RELAY_SOURCE_SHA" > /tmp/relay-source.sha
 COPY src/srt-bonding-relay.c .
-RUN g++ -O2 -o srt-bonding-relay srt-bonding-relay.c \
+RUN g++ -O2 -DRELAY_VERSION=\"${RELAY_VERSION}\" -o srt-bonding-relay srt-bonding-relay.c \
     $(pkg-config --cflags --libs srt) -lpthread -lssl -lcrypto -lm
 
 RUN set -eux; \
@@ -38,4 +39,3 @@ RUN set -eux; \
             *) cp -v "$lib" "$stage/lib/" ;; \
         esac; \
     done
-

@@ -8,6 +8,17 @@ CONTAINER_NAME="srt-bonding-relay-dev-$$"
 OUT_BIN="${SRT_BONDING_RELAY_PATH:-$REPO_DIR/objs/srt-bonding-relay}"
 OUT_LIB_DIR="${SRT_BONDING_RELAY_LIB_DIR:-$REPO_DIR/objs/lib}"
 SOURCE_SHA="$(sha256sum "$REPO_DIR/src/srt-bonding-relay.c" | awk '{print $1}')"
+VERSION_FILE="$REPO_DIR/VERSION"
+
+if [[ ! -f "$VERSION_FILE" ]]; then
+    echo "ERROR: VERSION file not found: $VERSION_FILE" >&2
+    exit 1
+fi
+RELAY_VERSION="$(tr -d '\r\n' < "$VERSION_FILE")"
+if [[ -z "$RELAY_VERSION" ]]; then
+    echo "ERROR: VERSION file is empty: $VERSION_FILE" >&2
+    exit 1
+fi
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "ERROR: Docker is required to build srt-bonding-relay locally." >&2
@@ -21,9 +32,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[relay-build] building Docker image $IMAGE_TAG"
+echo "[relay-build] building Docker image $IMAGE_TAG version=$RELAY_VERSION"
 docker build \
     --build-arg "SRT_TAG=$SRT_TAG" \
+    --build-arg "RELAY_VERSION=$RELAY_VERSION" \
     --build-arg "RELAY_SOURCE_SHA=$SOURCE_SHA" \
     -t "$IMAGE_TAG" \
     -f "$REPO_DIR/scripts/srt-bonding-relay.Dockerfile" \
@@ -42,4 +54,3 @@ if [[ -d "$STAGE/lib" ]]; then
 fi
 
 echo "Built relay: $OUT_BIN"
-

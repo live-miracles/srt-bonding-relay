@@ -38,10 +38,21 @@ to the downstream SRT publish socket automatically.
 
 All config fields are required.
 
+## Versioning
+
+The relay version is stored in the repo's `VERSION` file and embedded into the
+binary at build time.
+
 ## Local Build
 
 ```bash
 bash scripts/build-local.sh
+```
+
+Check the embedded version:
+
+```bash
+./objs/srt-bonding-relay --version
 ```
 
 Run it:
@@ -73,15 +84,19 @@ build/srt-bonding-relay-linux-x86_64.tar.gz
 Publish it to GitHub Releases, for example:
 
 ```bash
-gh release create v1.0.0 build/srt-bonding-relay-linux-x86_64.tar.gz \
-  --title "srt-bonding-relay v1.0.0" \
+gh release create "$(cat VERSION)" build/srt-bonding-relay-linux-x86_64.tar.gz \
+  --title "srt-bonding-relay $(cat VERSION)" \
   --notes "Initial standalone release"
 ```
+
+Before a release, update `VERSION` first. The binary version is embedded at
+build time, so changing `VERSION` after the asset is built will not update the
+already-built archive.
 
 If the release already exists:
 
 ```bash
-gh release upload v1.0.0 build/srt-bonding-relay-linux-x86_64.tar.gz --clobber
+gh release upload "$(cat VERSION)" build/srt-bonding-relay-linux-x86_64.tar.gz --clobber
 ```
 
 ## CI
