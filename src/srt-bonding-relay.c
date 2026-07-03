@@ -45,6 +45,7 @@
 #define LISTEN_BACKLOG 64
 #define MAX_EVENTS 16
 #define MAX_ACTIVE_SESSIONS 256
+#define MAX_GROUP_MEMBERS 16
 #define LAST_ERROR_MAX 512
 
 #ifndef RELAY_VERSION
@@ -65,11 +66,18 @@ typedef struct relay_stream_state {
     long long forwarded_bytes;
     long long last_packet_at_ms;
     long long recv_packets_total;
+    int recv_packets_total_valid;
     long long recv_unique_packets_total;
     int recv_loss_total;
     int recv_drop_total;
     int retrans_total;
     double rtt_ms;
+    int rtt_valid;
+    double input_rtt_ms;
+    int input_rtt_valid;
+    double output_rtt_ms;
+    int output_rtt_valid;
+    int group_member_count;
     long long last_stats_at_ms;
     char last_error[LAST_ERROR_MAX];
     long long last_error_at_ms;
@@ -293,12 +301,43 @@ static void update_stream_srt_counters(int slot, SRTSOCKET in_sock, SRTSOCKET ou
     memset(&in_stats, 0, sizeof in_stats);
     int have_in = in_sock != SRT_INVALID_SOCK && srt_bstats(in_sock, &in_stats, 0) != SRT_ERROR;
 
+    int is_group_sock = in_sock != SRT_INVALID_SOCK && (in_sock & SRTGROUP_MASK);
+    int group_member_count = 0;
+    int have_group_member_stats = 0;
+    double group_member_rtt_ms = 0.0;
+    if (is_group_sock) {
+        SRT_SOCKGROUPDATA members[MAX_GROUP_MEMBERS];
+        size_t member_count = MAX_GROUP_MEMBERS;
+        memset(members, 0, sizeof members);
+        if (srt_group_data(in_sock, members, &member_count) != SRT_ERROR) {
+            for (size_t i = 0; i < member_count; ++i) {
+                if (members[i].id == SRT_INVALID_SOCK) continue;
+                if (members[i].memberstate == SRT_GST_BROKEN) continue;
+                group_member_count++;
+
+                SRT_TRACEBSTATS member_stats;
+                memset(&member_stats, 0, sizeof member_stats);
+                if (srt_bstats(members[i].id, &member_stats, 0) == SRT_ERROR) continue;
+                if (member_stats.msRTT <= 0.0) continue;
+
+                have_group_member_stats = 1;
+                if (member_stats.msRTT > group_member_rtt_ms) {
+                    group_member_rtt_ms = member_stats.msRTT;
+                }
+            }
+        }
+    }
+
     SRT_TRACEBSTATS out_stats;
     memset(&out_stats, 0, sizeof out_stats);
     int have_out = out_sock != SRT_INVALID_SOCK && srt_bstats(out_sock, &out_stats, 0) != SRT_ERROR;
 
     pthread_mutex_lock(&g_sessions_mu);
     if (have_in) {
+        g_stream_states[slot].input_rtt_ms = in_stats.msRTT;
+        g_stream_states[slot].input_rtt_valid = in_stats.msRTT > 0.0;
+        g_stream_states[slot].recv_packets_total_valid =
+            !(is_group_sock && in_stats.pktRecvTotal == 0 && in_stats.pktRecvUniqueTotal > 0);
         g_stream_states[slot].recv_packets_total =
             max_ll(g_stream_states[slot].recv_packets_total, in_stats.pktRecvTotal);
         g_stream_states[slot].recv_unique_packets_total =
@@ -310,10 +349,22 @@ static void update_stream_srt_counters(int slot, SRTSOCKET in_sock, SRTSOCKET ou
         g_stream_states[slot].retrans_total =
             max_int(g_stream_states[slot].retrans_total, in_stats.pktRcvRetrans);
     }
-    if (have_in) {
+    if (have_out) {
+        g_stream_states[slot].output_rtt_ms = out_stats.msRTT;
+        g_stream_states[slot].output_rtt_valid = out_stats.msRTT > 0.0;
+    }
+    g_stream_states[slot].group_member_count = group_member_count;
+    if (have_group_member_stats) {
+        g_stream_states[slot].rtt_ms = group_member_rtt_ms;
+        g_stream_states[slot].rtt_valid = 1;
+    } else if (is_group_sock) {
+        g_stream_states[slot].rtt_valid = 0;
+    } else if (have_in) {
         g_stream_states[slot].rtt_ms = in_stats.msRTT;
+        g_stream_states[slot].rtt_valid = in_stats.msRTT > 0.0;
     } else if (have_out) {
         g_stream_states[slot].rtt_ms = out_stats.msRTT;
+        g_stream_states[slot].rtt_valid = out_stats.msRTT > 0.0;
     }
     g_stream_states[slot].last_stats_at_ms = now;
     pthread_mutex_unlock(&g_sessions_mu);
@@ -370,20 +421,45 @@ static void write_status_response(int client_fd)
         fprintf(f, "%s\n    {\n      \"streamId\": \"", first ? "\n" : ",\n");
         json_write_escaped(f, g_stream_states[i].streamid);
         fprintf(f,
-                "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      \"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      \"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      \"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": %lld,\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      \"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": %.3f,\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
+                "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      \"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      \"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      \"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": ",
                 g_stream_states[i].input_active ? "true" : "false",
                 g_stream_states[i].output_connected ? "true" : "false",
                 g_stream_states[i].retry_failures,
                 g_stream_states[i].forwarded_packets,
                 g_stream_states[i].forwarded_bytes,
                 g_stream_states[i].last_packet_at_ms,
-                g_stream_states[i].last_input_packet_at_ms,
-                g_stream_states[i].recv_packets_total,
+                g_stream_states[i].last_input_packet_at_ms);
+        if (g_stream_states[i].recv_packets_total_valid) {
+            fprintf(f, "%lld", g_stream_states[i].recv_packets_total);
+        } else {
+            fputs("null", f);
+        }
+        fprintf(f,
+                ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      \"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": ",
                 g_stream_states[i].recv_unique_packets_total,
                 g_stream_states[i].recv_loss_total,
                 g_stream_states[i].recv_drop_total,
-                g_stream_states[i].retrans_total,
-                g_stream_states[i].rtt_ms,
+                g_stream_states[i].retrans_total);
+        if (g_stream_states[i].rtt_valid) {
+            fprintf(f, "%.3f", g_stream_states[i].rtt_ms);
+        } else {
+            fputs("null", f);
+        }
+        fputs(",\n      \"inputRttMs\": ", f);
+        if (g_stream_states[i].input_rtt_valid) {
+            fprintf(f, "%.3f", g_stream_states[i].input_rtt_ms);
+        } else {
+            fputs("null", f);
+        }
+        fputs(",\n      \"outputRttMs\": ", f);
+        if (g_stream_states[i].output_rtt_valid) {
+            fprintf(f, "%.3f", g_stream_states[i].output_rtt_ms);
+        } else {
+            fputs("null", f);
+        }
+        fprintf(f,
+                ",\n      \"groupMemberCount\": %d,\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
+                g_stream_states[i].group_member_count,
                 g_stream_states[i].last_error_at_ms);
         if (g_stream_states[i].last_error[0]) {
             fputc('"', f);
