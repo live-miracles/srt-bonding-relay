@@ -307,13 +307,13 @@ static void update_stream_srt_counters(int slot, SRTSOCKET in_sock, SRTSOCKET ou
             max_int(g_stream_states[slot].recv_loss_total, in_stats.pktRcvLossTotal);
         g_stream_states[slot].recv_drop_total =
             max_int(g_stream_states[slot].recv_drop_total, in_stats.pktRcvDropTotal);
-    }
-    if (have_out) {
         g_stream_states[slot].retrans_total =
-            max_int(g_stream_states[slot].retrans_total, out_stats.pktRetransTotal);
-        g_stream_states[slot].rtt_ms = out_stats.msRTT;
-    } else if (have_in) {
+            max_int(g_stream_states[slot].retrans_total, in_stats.pktRcvRetrans);
+    }
+    if (have_in) {
         g_stream_states[slot].rtt_ms = in_stats.msRTT;
+    } else if (have_out) {
+        g_stream_states[slot].rtt_ms = out_stats.msRTT;
     }
     g_stream_states[slot].last_stats_at_ms = now;
     pthread_mutex_unlock(&g_sessions_mu);
