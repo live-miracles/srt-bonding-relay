@@ -19,7 +19,7 @@
  *     "input_port": 10081,
  *     "output_host": "127.0.0.1",
  *     "output_port": 10080,
- *     "status_port": 10082,
+ *     "status_port": 8081,
  *     "passphrase": "secret-value"
  *   }
  */
@@ -88,7 +88,7 @@ static pthread_mutex_t g_sessions_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_last_error[512];
 static relay_stream_state_t g_stream_states[MAX_ACTIVE_SESSIONS];
 static long long g_started_at_ms = 0;
-static int g_status_port = 10082;
+static int g_status_port = 8081;
 
 static void on_signal(int s)
 {
