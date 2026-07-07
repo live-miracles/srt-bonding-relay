@@ -85,8 +85,13 @@ typedef struct relay_stream_state {
 
 static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_sessions_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_session_threads_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_session_threads_cond = PTHREAD_COND_INITIALIZER;
 static char g_last_error[512];
 static relay_stream_state_t g_stream_states[MAX_ACTIVE_SESSIONS];
+static SRTSOCKET g_active_session_sockets[MAX_ACTIVE_SESSIONS];
+static int g_active_session_slots[MAX_ACTIVE_SESSIONS];
+static int g_active_session_threads = 0;
 static long long g_started_at_ms = 0;
 static int g_status_port = 8081;
 
@@ -94,6 +99,112 @@ static void on_signal(int s)
 {
     (void)s;
     g_running = 0;
+}
+
+static int install_signal_handlers(void)
+{
+    struct sigaction stop_sa;
+    memset(&stop_sa, 0, sizeof stop_sa);
+    stop_sa.sa_handler = on_signal;
+    sigemptyset(&stop_sa.sa_mask);
+
+    if (sigaction(SIGINT, &stop_sa, NULL) < 0) return -1;
+    if (sigaction(SIGTERM, &stop_sa, NULL) < 0) return -1;
+
+    struct sigaction pipe_sa;
+    memset(&pipe_sa, 0, sizeof pipe_sa);
+    pipe_sa.sa_handler = SIG_IGN;
+    sigemptyset(&pipe_sa.sa_mask);
+    if (sigaction(SIGPIPE, &pipe_sa, NULL) < 0) return -1;
+
+    return 0;
+}
+
+static void init_session_tracking(void)
+{
+    pthread_mutex_lock(&g_session_threads_mu);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        g_active_session_sockets[i] = SRT_INVALID_SOCK;
+        g_active_session_slots[i] = 0;
+    }
+    g_active_session_threads = 0;
+    pthread_mutex_unlock(&g_session_threads_mu);
+}
+
+static int register_session_thread(SRTSOCKET conn)
+{
+    int slot = -1;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        if (!g_active_session_slots[i]) {
+            slot = i;
+            g_active_session_slots[i] = 1;
+            g_active_session_sockets[i] = conn;
+            g_active_session_threads++;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    return slot;
+}
+
+static SRTSOCKET take_tracked_session_socket(int slot)
+{
+    SRTSOCKET sock = SRT_INVALID_SOCK;
+
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return SRT_INVALID_SOCK;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_active_session_slots[slot] && g_active_session_sockets[slot] != SRT_INVALID_SOCK) {
+        sock = g_active_session_sockets[slot];
+        g_active_session_sockets[slot] = SRT_INVALID_SOCK;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    return sock;
+}
+
+static void unregister_session_thread(int slot)
+{
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_active_session_slots[slot]) {
+        g_active_session_slots[slot] = 0;
+        g_active_session_sockets[slot] = SRT_INVALID_SOCK;
+        if (g_active_session_threads > 0) g_active_session_threads--;
+        pthread_cond_broadcast(&g_session_threads_cond);
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+}
+
+static void close_active_session_sockets(void)
+{
+    SRTSOCKET sockets[MAX_ACTIVE_SESSIONS];
+    int count = 0;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        if (!g_active_session_slots[i] || g_active_session_sockets[i] == SRT_INVALID_SOCK) continue;
+        sockets[count++] = g_active_session_sockets[i];
+        g_active_session_sockets[i] = SRT_INVALID_SOCK;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    for (int i = 0; i < count; ++i) {
+        srt_close(sockets[i]);
+    }
+}
+
+static void wait_for_session_threads(void)
+{
+    pthread_mutex_lock(&g_session_threads_mu);
+    while (g_active_session_threads > 0) {
+        pthread_cond_wait(&g_session_threads_cond, &g_session_threads_mu);
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
 }
 
 typedef struct relay_config {
@@ -106,6 +217,7 @@ typedef struct relay_config {
 typedef struct session_args {
     SRTSOCKET conn;
     const relay_config_t *cfg;
+    int tracker_slot;
 } session_args_t;
 
 typedef struct file_config {
@@ -144,7 +256,11 @@ static void json_write_escaped(FILE *f, const char *s)
             fputs("\\t", f);
             break;
         default:
-            fputc(*p, f);
+            if (*p < 0x20) {
+                fprintf(f, "\\u%04x", *p);
+            } else {
+                fputc(*p, f);
+            }
             break;
         }
     }
@@ -190,9 +306,7 @@ static int add_stream_state(const char *streamid)
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
         if (g_stream_states[i].streamid[0] &&
             strcmp(g_stream_states[i].streamid, streamid) == 0) {
-            slot = i;
-            g_stream_states[i].input_sessions++;
-            g_stream_states[i].input_active = 1;
+            slot = -2;
             break;
         }
     }
@@ -216,12 +330,6 @@ static void remove_stream_state(int slot)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    if (g_stream_states[slot].input_sessions > 1) {
-        g_stream_states[slot].input_sessions--;
-        g_stream_states[slot].input_active = 1;
-        pthread_mutex_unlock(&g_sessions_mu);
-        return;
-    }
     memset(&g_stream_states[slot], 0, sizeof g_stream_states[slot]);
     pthread_mutex_unlock(&g_sessions_mu);
 }
@@ -230,10 +338,6 @@ static void set_stream_output_connected(int slot, int connected)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    if (!connected && g_stream_states[slot].input_sessions > 1) {
-        pthread_mutex_unlock(&g_sessions_mu);
-        return;
-    }
     g_stream_states[slot].output_connected = connected;
     if (connected) {
         g_stream_states[slot].retry_failures = 0;
@@ -378,10 +482,23 @@ static int stream_input_still_connected(SRTSOCKET conn)
 
 static void write_status_response(int client_fd)
 {
-    FILE *f = fdopen(dup(client_fd), "w");
-    if (!f) return;
+    relay_stream_state_t states[MAX_ACTIVE_SESSIONS];
+    char last_error[sizeof g_last_error];
+    long long updated_at_ms = now_ms();
 
     pthread_mutex_lock(&g_sessions_mu);
+    memcpy(states, g_stream_states, sizeof states);
+    memcpy(last_error, g_last_error, sizeof last_error);
+    pthread_mutex_unlock(&g_sessions_mu);
+
+    int out_fd = dup(client_fd);
+    if (out_fd < 0) return;
+    FILE *f = fdopen(out_fd, "w");
+    if (!f) {
+        close(out_fd);
+        return;
+    }
+
     fprintf(f,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
@@ -395,10 +512,10 @@ static void write_status_response(int client_fd)
             "  \"lastError\": ",
             (long)getpid(),
             g_started_at_ms,
-            now_ms());
-    if (g_last_error[0]) {
+            updated_at_ms);
+    if (last_error[0]) {
         fputc('"', f);
-        json_write_escaped(f, g_last_error);
+        json_write_escaped(f, last_error);
         fputs("\",\n", f);
     } else {
         fputs("null,\n", f);
@@ -407,9 +524,9 @@ static void write_status_response(int client_fd)
 
     int first = 1;
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (!g_stream_states[i].streamid[0] || !g_stream_states[i].input_active) continue;
+        if (!states[i].streamid[0] || !states[i].input_active) continue;
         fprintf(f, "%s\n    \"", first ? "\n" : ",\n");
-        json_write_escaped(f, g_stream_states[i].streamid);
+        json_write_escaped(f, states[i].streamid);
         fputc('"', f);
         first = 0;
     }
@@ -417,53 +534,53 @@ static void write_status_response(int client_fd)
 
     first = 1;
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (!g_stream_states[i].streamid[0]) continue;
+        if (!states[i].streamid[0]) continue;
         fprintf(f, "%s\n    {\n      \"streamId\": \"", first ? "\n" : ",\n");
-        json_write_escaped(f, g_stream_states[i].streamid);
+        json_write_escaped(f, states[i].streamid);
         fprintf(f,
                 "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      \"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      \"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      \"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": ",
-                g_stream_states[i].input_active ? "true" : "false",
-                g_stream_states[i].output_connected ? "true" : "false",
-                g_stream_states[i].retry_failures,
-                g_stream_states[i].forwarded_packets,
-                g_stream_states[i].forwarded_bytes,
-                g_stream_states[i].last_packet_at_ms,
-                g_stream_states[i].last_input_packet_at_ms);
-        if (g_stream_states[i].recv_packets_total_valid) {
-            fprintf(f, "%lld", g_stream_states[i].recv_packets_total);
+                states[i].input_active ? "true" : "false",
+                states[i].output_connected ? "true" : "false",
+                states[i].retry_failures,
+                states[i].forwarded_packets,
+                states[i].forwarded_bytes,
+                states[i].last_packet_at_ms,
+                states[i].last_input_packet_at_ms);
+        if (states[i].recv_packets_total_valid) {
+            fprintf(f, "%lld", states[i].recv_packets_total);
         } else {
             fputs("null", f);
         }
         fprintf(f,
                 ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      \"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": ",
-                g_stream_states[i].recv_unique_packets_total,
-                g_stream_states[i].recv_loss_total,
-                g_stream_states[i].recv_drop_total,
-                g_stream_states[i].retrans_total);
-        if (g_stream_states[i].rtt_valid) {
-            fprintf(f, "%.3f", g_stream_states[i].rtt_ms);
+                states[i].recv_unique_packets_total,
+                states[i].recv_loss_total,
+                states[i].recv_drop_total,
+                states[i].retrans_total);
+        if (states[i].rtt_valid) {
+            fprintf(f, "%.3f", states[i].rtt_ms);
         } else {
             fputs("null", f);
         }
         fputs(",\n      \"inputRttMs\": ", f);
-        if (g_stream_states[i].input_rtt_valid) {
-            fprintf(f, "%.3f", g_stream_states[i].input_rtt_ms);
+        if (states[i].input_rtt_valid) {
+            fprintf(f, "%.3f", states[i].input_rtt_ms);
         } else {
             fputs("null", f);
         }
         fputs(",\n      \"outputRttMs\": ", f);
-        if (g_stream_states[i].output_rtt_valid) {
-            fprintf(f, "%.3f", g_stream_states[i].output_rtt_ms);
+        if (states[i].output_rtt_valid) {
+            fprintf(f, "%.3f", states[i].output_rtt_ms);
         } else {
             fputs("null", f);
         }
         fprintf(f,
                 ",\n      \"groupMemberCount\": %d,\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
-                g_stream_states[i].group_member_count,
-                g_stream_states[i].last_error_at_ms);
-        if (g_stream_states[i].last_error[0]) {
+                states[i].group_member_count,
+                states[i].last_error_at_ms);
+        if (states[i].last_error[0]) {
             fputc('"', f);
-            json_write_escaped(f, g_stream_states[i].last_error);
+            json_write_escaped(f, states[i].last_error);
             fputs("\"\n    }", f);
         } else {
             fputs("null\n    }", f);
@@ -471,7 +588,6 @@ static void write_status_response(int client_fd)
         first = 0;
     }
     fprintf(f, "%s\n  ]\n}\n", first ? "" : "\n");
-    pthread_mutex_unlock(&g_sessions_mu);
     fclose(f);
 }
 
@@ -524,7 +640,11 @@ static void *status_http_main(void *arg)
         if (client < 0) continue;
 
         char req[1024];
-        recv(client, req, sizeof req, 0);
+        ssize_t req_len = recv(client, req, sizeof req, 0);
+        if (req_len <= 0) {
+            close(client);
+            continue;
+        }
         write_status_response(client);
         close(client);
     }
@@ -683,8 +803,38 @@ static void append_param_int(char *buf, size_t buf_sz, int *first, const char *k
     append_param(buf, buf_sz, first, key, tmp);
 }
 
-static void build_srt_uri(char *out, size_t out_sz, const char *host, int port, const char *passphrase,
-                          int include_groupconnect)
+static int uri_is_unreserved(unsigned char c)
+{
+    return (c >= 'A' && c <= 'Z') ||
+           (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~';
+}
+
+static int url_encode_component(const char *in, char *out, size_t out_sz)
+{
+    static const char hex[] = "0123456789ABCDEF";
+    size_t used = 0;
+
+    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
+        if (uri_is_unreserved(*p)) {
+            if (used + 1 >= out_sz) return -1;
+            out[used++] = (char)*p;
+        } else {
+            if (used + 3 >= out_sz) return -1;
+            out[used++] = '%';
+            out[used++] = hex[*p >> 4];
+            out[used++] = hex[*p & 0x0f];
+        }
+    }
+
+    if (used >= out_sz) return -1;
+    out[used] = '\0';
+    return 0;
+}
+
+static int build_srt_uri(char *out, size_t out_sz, const char *host, int port, const char *passphrase,
+                         int include_groupconnect)
 {
     snprintf(out, out_sz, "srt://%s:%d", host, port);
     int first = 1;
@@ -693,9 +843,12 @@ static void build_srt_uri(char *out, size_t out_sz, const char *host, int port, 
     append_param(out, out_sz, &first, "transtype", "live");
     append_param_int(out, out_sz, &first, "latency", include_groupconnect ? 240 : 200);
     if (passphrase && passphrase[0]) {
-        append_param(out, out_sz, &first, "passphrase", passphrase);
+        char encoded_passphrase[sizeof(((file_config_t *)0)->passphrase) * 3];
+        if (url_encode_component(passphrase, encoded_passphrase, sizeof encoded_passphrase) != 0) return -1;
+        append_param(out, out_sz, &first, "passphrase", encoded_passphrase);
         append_param_int(out, out_sz, &first, "pbkeylen", 16);
     }
+    return 0;
 }
 
 static int read_file(const char *path, char **buf_out, size_t *len_out)
@@ -844,6 +997,7 @@ static void *session_main(void *arg)
     session_args_t *args = (session_args_t *)arg;
     SRTSOCKET conn = args->conn;
     const relay_config_t *cfg = args->cfg;
+    int tracker_slot = args->tracker_slot;
     free(args);
 
     char streamid[1024];
@@ -855,10 +1009,17 @@ static void *session_main(void *arg)
 
     fprintf(stderr, "Accepted bonded SRT source streamid=%s\n", streamid[0] ? streamid : "(empty)");
     int state_slot = add_stream_state(streamid);
-
     int udp_fd = -1;
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
+
+    /* A bonded SRT group is one accepted publisher session; duplicate stream IDs here are
+     * separate accepted publisher sessions, not individual group members reconnecting. */
+    if (state_slot == -2) {
+        set_last_errorf("Duplicate publisher rejected for streamid=%s", streamid);
+        fprintf(stderr, "Duplicate publisher rejected for streamid=%s\n", streamid);
+        goto cleanup;
+    }
 
     if (cfg->udp_out) {
         udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -866,9 +1027,8 @@ static void *session_main(void *arg)
             set_last_errorf("socket(UDP): %s", strerror(errno));
             set_stream_errorf(state_slot, "socket(UDP): %s", strerror(errno));
             perror("socket(UDP)");
-            srt_close(conn);
             remove_stream_state(state_slot);
-            return NULL;
+            goto cleanup;
         }
     } else {
         srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, &next_output_retry_at_ms);
@@ -916,9 +1076,14 @@ static void *session_main(void *arg)
     if (udp_fd >= 0) close(udp_fd);
     update_stream_srt_counters(state_slot, conn, srt_out, 1);
     if (srt_out != SRT_INVALID_SOCK) srt_close(srt_out);
-    srt_close(conn);
     remove_stream_state(state_slot);
     fprintf(stderr, "Connection closed streamid=%s\n", streamid[0] ? streamid : "(empty)");
+
+cleanup:
+    if (take_tracked_session_socket(tracker_slot) != SRT_INVALID_SOCK) {
+        srt_close(conn);
+    }
+    unregister_session_thread(tracker_slot);
     return NULL;
 }
 
@@ -938,6 +1103,39 @@ static int resolve_output(const char *host, int port, relay_config_t *cfg)
     }
     cfg->out_addrlen = (socklen_t)res->ai_addrlen;
     memcpy(&cfg->out_addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
+    return 0;
+}
+
+static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_in *sa)
+{
+    memset(sa, 0, sizeof *sa);
+    sa->sin_family = AF_INET;
+    sa->sin_port = htons((unsigned short)port);
+
+    if (!host || !host[0] || strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa->sin_addr.s_addr = htonl(INADDR_ANY);
+        return 0;
+    }
+
+    struct addrinfo hints;
+    struct addrinfo *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+
+    char portstr[16];
+    snprintf(portstr, sizeof portstr, "%d", port);
+    int rc = getaddrinfo(host, portstr, &hints, &res);
+    if (rc != 0 || !res) {
+        fprintf(stderr, "getaddrinfo failed for input %s:%d: %s\n", host, port,
+                rc == 0 ? "no address" : gai_strerror(rc));
+        return -1;
+    }
+
+    struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
+    memcpy(sa, resolved, sizeof *sa);
     freeaddrinfo(res);
     return 0;
 }
@@ -969,20 +1167,23 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Bad config file: %s\n", argv[1]);
             return 1;
         }
-        build_srt_uri(
-            input_uri,
-            sizeof input_uri,
-            file_cfg.input_host,
-            file_cfg.input_port,
-            file_cfg.passphrase,
-            1);
-        build_srt_uri(
-            output_uri,
-            sizeof output_uri,
-            file_cfg.output_host,
-            file_cfg.output_port,
-            file_cfg.passphrase,
-            0);
+        if (build_srt_uri(
+                input_uri,
+                sizeof input_uri,
+                file_cfg.input_host,
+                file_cfg.input_port,
+                file_cfg.passphrase,
+                1) != 0 ||
+            build_srt_uri(
+                output_uri,
+                sizeof output_uri,
+                file_cfg.output_host,
+                file_cfg.output_port,
+                file_cfg.passphrase,
+                0) != 0) {
+            fprintf(stderr, "Bad config file: failed to build SRT URI\n");
+            return 1;
+        }
         if (file_cfg.status_port > 0 && file_cfg.status_port <= 65535) {
             g_status_port = file_cfg.status_port;
         }
@@ -1029,8 +1230,11 @@ int main(int argc, char *argv[])
     }
     g_started_at_ms = now_ms();
 
-    signal(SIGINT, on_signal);
-    signal(SIGTERM, on_signal);
+    if (install_signal_handlers() != 0) {
+        fprintf(stderr, "install signal handlers failed: %s\n", strerror(errno));
+        return 1;
+    }
+    init_session_tracking();
 
     srt_startup();
 
@@ -1045,14 +1249,15 @@ int main(int argc, char *argv[])
     apply_srt_opts(srv, in_query);
 
     struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = INADDR_ANY;
-    sa.sin_port = htons(in_port);
+    if (resolve_input_bind_addr(in_host, in_port, &sa) < 0) {
+        srt_close(srv);
+        srt_cleanup();
+        return 1;
+    }
 
     if (srt_bind(srv, (struct sockaddr *)&sa, sizeof sa) == SRT_ERROR) {
-        set_last_errorf("srt_bind :%d: %s", in_port, srt_getlasterror_str());
-        fprintf(stderr, "srt_bind :%d: %s\n", in_port, srt_getlasterror_str());
+        set_last_errorf("srt_bind %s:%d: %s", in_host, in_port, srt_getlasterror_str());
+        fprintf(stderr, "srt_bind %s:%d: %s\n", in_host, in_port, srt_getlasterror_str());
         srt_close(srv);
         srt_cleanup();
         return 1;
@@ -1065,8 +1270,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    fprintf(stderr, "Listening on bonded SRT :%d (backlog=%d) -> %s\n", in_port, LISTEN_BACKLOG,
-            output_uri);
+    fprintf(stderr, "Listening on bonded SRT %s:%d (backlog=%d) -> %s\n", in_host, in_port,
+            LISTEN_BACKLOG, output_uri);
 
     pthread_t status_tid;
     int status_thread_started = pthread_create(&status_tid, NULL, status_http_main, NULL) == 0;
@@ -1076,8 +1281,26 @@ int main(int argc, char *argv[])
     }
 
     int ep = srt_epoll_create();
+    if (ep < 0) {
+        set_last_errorf("srt_epoll_create: %s", srt_getlasterror_str());
+        fprintf(stderr, "srt_epoll_create: %s\n", srt_getlasterror_str());
+        srt_close(srv);
+        g_running = 0;
+        if (status_thread_started) pthread_join(status_tid, NULL);
+        srt_cleanup();
+        return 1;
+    }
     int ep_events = SRT_EPOLL_IN | SRT_EPOLL_ERR;
-    srt_epoll_add_usock(ep, srv, &ep_events);
+    if (srt_epoll_add_usock(ep, srv, &ep_events) == SRT_ERROR) {
+        set_last_errorf("srt_epoll_add_usock: %s", srt_getlasterror_str());
+        fprintf(stderr, "srt_epoll_add_usock: %s\n", srt_getlasterror_str());
+        srt_epoll_release(ep);
+        srt_close(srv);
+        g_running = 0;
+        if (status_thread_started) pthread_join(status_tid, NULL);
+        srt_cleanup();
+        return 1;
+    }
 
     while (g_running) {
         SRT_EPOLL_EVENT ev[MAX_EVENTS];
@@ -1105,11 +1328,20 @@ int main(int argc, char *argv[])
             }
             args->conn = conn;
             args->cfg = &cfg;
+            args->tracker_slot = register_session_thread(conn);
+            if (args->tracker_slot < 0) {
+                set_last_errorf("Too many active sessions; rejecting connection");
+                fprintf(stderr, "Too many active sessions; rejecting connection\n");
+                srt_close(conn);
+                free(args);
+                continue;
+            }
 
             pthread_t tid;
             if (pthread_create(&tid, NULL, session_main, args) != 0) {
                 set_last_errorf("pthread_create(session) failed");
                 fprintf(stderr, "pthread_create failed\n");
+                unregister_session_thread(args->tracker_slot);
                 srt_close(conn);
                 free(args);
                 continue;
@@ -1118,8 +1350,11 @@ int main(int argc, char *argv[])
         }
     }
 
+    g_running = 0;
     srt_epoll_release(ep);
     srt_close(srv);
+    close_active_session_sockets();
+    wait_for_session_threads();
     if (status_thread_started) pthread_join(status_tid, NULL);
     srt_cleanup();
     return 0;
