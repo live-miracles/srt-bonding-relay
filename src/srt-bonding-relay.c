@@ -47,6 +47,8 @@
 #define MAX_ACTIVE_SESSIONS 256
 #define MAX_GROUP_MEMBERS 16
 #define LAST_ERROR_MAX 512
+#define DUPLICATE_TAKEOVER_WAIT_MS 5000
+#define DUPLICATE_TAKEOVER_STALE_MS 5000
 
 #ifndef RELAY_VERSION
 #define RELAY_VERSION "dev"
@@ -57,7 +59,6 @@ static const int RETRY_DELAYS_MS[] = {1000, 2000, 4000, 8000, 16000};
 
 typedef struct relay_stream_state {
     char streamid[1024];
-    int input_sessions;
     int input_active;
     int output_connected;
     int retry_failures;
@@ -83,14 +84,24 @@ typedef struct relay_stream_state {
     long long last_error_at_ms;
 } relay_stream_state_t;
 
+typedef struct active_session {
+    int in_use;
+    char streamid[1024];
+    SRTSOCKET input_sock;
+    SRTSOCKET output_sock;
+} active_session_t;
+
+typedef struct relay_session_slot {
+    relay_stream_state_t state;
+    active_session_t active;
+} relay_session_slot_t;
+
 static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_sessions_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_session_threads_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_session_threads_cond = PTHREAD_COND_INITIALIZER;
 static char g_last_error[512];
-static relay_stream_state_t g_stream_states[MAX_ACTIVE_SESSIONS];
-static SRTSOCKET g_active_session_sockets[MAX_ACTIVE_SESSIONS];
-static int g_active_session_slots[MAX_ACTIVE_SESSIONS];
+static relay_session_slot_t g_sessions[MAX_ACTIVE_SESSIONS];
 static int g_active_session_threads = 0;
 static long long g_started_at_ms = 0;
 static int g_status_port = 8081;
@@ -124,8 +135,9 @@ static void init_session_tracking(void)
 {
     pthread_mutex_lock(&g_session_threads_mu);
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        g_active_session_sockets[i] = SRT_INVALID_SOCK;
-        g_active_session_slots[i] = 0;
+        memset(&g_sessions[i].active, 0, sizeof g_sessions[i].active);
+        g_sessions[i].active.input_sock = SRT_INVALID_SOCK;
+        g_sessions[i].active.output_sock = SRT_INVALID_SOCK;
     }
     g_active_session_threads = 0;
     pthread_mutex_unlock(&g_session_threads_mu);
@@ -137,10 +149,12 @@ static int register_session_thread(SRTSOCKET conn)
 
     pthread_mutex_lock(&g_session_threads_mu);
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (!g_active_session_slots[i]) {
+        if (!g_sessions[i].active.in_use) {
             slot = i;
-            g_active_session_slots[i] = 1;
-            g_active_session_sockets[i] = conn;
+            memset(&g_sessions[i].active, 0, sizeof g_sessions[i].active);
+            g_sessions[i].active.in_use = 1;
+            g_sessions[i].active.input_sock = conn;
+            g_sessions[i].active.output_sock = SRT_INVALID_SOCK;
             g_active_session_threads++;
             break;
         }
@@ -150,20 +164,108 @@ static int register_session_thread(SRTSOCKET conn)
     return slot;
 }
 
-static SRTSOCKET take_tracked_session_socket(int slot)
+static void set_tracked_session_streamid(int slot, const char *streamid)
+{
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_sessions[slot].active.in_use) {
+        g_sessions[slot].active.streamid[0] = '\0';
+        if (streamid) {
+            strncpy(g_sessions[slot].active.streamid, streamid,
+                    sizeof g_sessions[slot].active.streamid - 1);
+            g_sessions[slot].active.streamid[sizeof g_sessions[slot].active.streamid - 1] = '\0';
+        }
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+}
+
+static void set_tracked_session_output_socket(int slot, SRTSOCKET sock)
+{
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_sessions[slot].active.in_use) {
+        g_sessions[slot].active.output_sock = sock;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+}
+
+static SRTSOCKET take_tracked_input_socket(int slot, SRTSOCKET expected)
 {
     SRTSOCKET sock = SRT_INVALID_SOCK;
 
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return SRT_INVALID_SOCK;
 
     pthread_mutex_lock(&g_session_threads_mu);
-    if (g_active_session_slots[slot] && g_active_session_sockets[slot] != SRT_INVALID_SOCK) {
-        sock = g_active_session_sockets[slot];
-        g_active_session_sockets[slot] = SRT_INVALID_SOCK;
+    if (g_sessions[slot].active.in_use && g_sessions[slot].active.input_sock == expected) {
+        sock = g_sessions[slot].active.input_sock;
+        g_sessions[slot].active.input_sock = SRT_INVALID_SOCK;
     }
     pthread_mutex_unlock(&g_session_threads_mu);
 
     return sock;
+}
+
+static SRTSOCKET take_tracked_output_socket(int slot, SRTSOCKET expected)
+{
+    SRTSOCKET sock = SRT_INVALID_SOCK;
+
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return SRT_INVALID_SOCK;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_sessions[slot].active.in_use && g_sessions[slot].active.output_sock == expected) {
+        sock = g_sessions[slot].active.output_sock;
+        g_sessions[slot].active.output_sock = SRT_INVALID_SOCK;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    return sock;
+}
+
+static int tracked_socket_is_current(int slot, SRTSOCKET input_sock, SRTSOCKET output_sock)
+{
+    int current = 0;
+
+    if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return 0;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    if (g_sessions[slot].active.in_use &&
+        (input_sock == SRT_INVALID_SOCK || g_sessions[slot].active.input_sock == input_sock) &&
+        (output_sock == SRT_INVALID_SOCK || g_sessions[slot].active.output_sock == output_sock)) {
+        current = 1;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    return current;
+}
+
+static void close_tracked_sessions_for_streamid(const char *streamid, int except_slot)
+{
+    SRTSOCKET sockets[MAX_ACTIVE_SESSIONS * 2];
+    int count = 0;
+
+    if (!streamid || !streamid[0]) return;
+
+    pthread_mutex_lock(&g_session_threads_mu);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        if (!g_sessions[i].active.in_use || i == except_slot) continue;
+        if (strcmp(g_sessions[i].active.streamid, streamid) != 0) continue;
+
+        if (g_sessions[i].active.input_sock != SRT_INVALID_SOCK) {
+            sockets[count++] = g_sessions[i].active.input_sock;
+            g_sessions[i].active.input_sock = SRT_INVALID_SOCK;
+        }
+        if (g_sessions[i].active.output_sock != SRT_INVALID_SOCK) {
+            sockets[count++] = g_sessions[i].active.output_sock;
+            g_sessions[i].active.output_sock = SRT_INVALID_SOCK;
+        }
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
+
+    for (int i = 0; i < count; ++i) {
+        srt_close(sockets[i]);
+    }
 }
 
 static void unregister_session_thread(int slot)
@@ -171,9 +273,10 @@ static void unregister_session_thread(int slot)
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     pthread_mutex_lock(&g_session_threads_mu);
-    if (g_active_session_slots[slot]) {
-        g_active_session_slots[slot] = 0;
-        g_active_session_sockets[slot] = SRT_INVALID_SOCK;
+    if (g_sessions[slot].active.in_use) {
+        memset(&g_sessions[slot].active, 0, sizeof g_sessions[slot].active);
+        g_sessions[slot].active.input_sock = SRT_INVALID_SOCK;
+        g_sessions[slot].active.output_sock = SRT_INVALID_SOCK;
         if (g_active_session_threads > 0) g_active_session_threads--;
         pthread_cond_broadcast(&g_session_threads_cond);
     }
@@ -182,14 +285,20 @@ static void unregister_session_thread(int slot)
 
 static void close_active_session_sockets(void)
 {
-    SRTSOCKET sockets[MAX_ACTIVE_SESSIONS];
+    SRTSOCKET sockets[MAX_ACTIVE_SESSIONS * 2];
     int count = 0;
 
     pthread_mutex_lock(&g_session_threads_mu);
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (!g_active_session_slots[i] || g_active_session_sockets[i] == SRT_INVALID_SOCK) continue;
-        sockets[count++] = g_active_session_sockets[i];
-        g_active_session_sockets[i] = SRT_INVALID_SOCK;
+        if (!g_sessions[i].active.in_use) continue;
+        if (g_sessions[i].active.input_sock != SRT_INVALID_SOCK) {
+            sockets[count++] = g_sessions[i].active.input_sock;
+            g_sessions[i].active.input_sock = SRT_INVALID_SOCK;
+        }
+        if (g_sessions[i].active.output_sock != SRT_INVALID_SOCK) {
+            sockets[count++] = g_sessions[i].active.output_sock;
+            g_sessions[i].active.output_sock = SRT_INVALID_SOCK;
+        }
     }
     pthread_mutex_unlock(&g_session_threads_mu);
 
@@ -282,9 +391,9 @@ static void set_stream_errorf(int slot, const char *fmt, ...)
     pthread_mutex_lock(&g_sessions_mu);
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(g_stream_states[slot].last_error, sizeof g_stream_states[slot].last_error, fmt, ap);
+    vsnprintf(g_sessions[slot].state.last_error, sizeof g_sessions[slot].state.last_error, fmt, ap);
     va_end(ap);
-    g_stream_states[slot].last_error_at_ms = now_ms();
+    g_sessions[slot].state.last_error_at_ms = now_ms();
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -298,39 +407,64 @@ static int max_int(int a, int b)
     return a > b ? a : b;
 }
 
-static int add_stream_state(const char *streamid)
+static int claim_stream_state(const char *streamid, int preferred_slot)
 {
     if (!streamid || !streamid[0]) return -1;
     pthread_mutex_lock(&g_sessions_mu);
     int slot = -1;
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (g_stream_states[i].streamid[0] &&
-            strcmp(g_stream_states[i].streamid, streamid) == 0) {
+        if (g_sessions[i].state.streamid[0] &&
+            strcmp(g_sessions[i].state.streamid, streamid) == 0) {
             slot = -2;
             break;
         }
     }
     if (slot == -1) {
-        for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-            if (!g_stream_states[i].streamid[0]) {
-                slot = i;
-                memset(&g_stream_states[i], 0, sizeof g_stream_states[i]);
-                strncpy(g_stream_states[i].streamid, streamid, sizeof g_stream_states[i].streamid - 1);
-                g_stream_states[i].input_sessions = 1;
-                g_stream_states[i].input_active = 1;
-                break;
-            }
+        if (preferred_slot >= 0 && preferred_slot < MAX_ACTIVE_SESSIONS &&
+            !g_sessions[preferred_slot].state.streamid[0]) {
+            slot = preferred_slot;
+        }
+        if (slot >= 0) {
+            memset(&g_sessions[slot].state, 0, sizeof g_sessions[slot].state);
+            strncpy(g_sessions[slot].state.streamid, streamid,
+                    sizeof g_sessions[slot].state.streamid - 1);
+            g_sessions[slot].state.streamid[sizeof g_sessions[slot].state.streamid - 1] = '\0';
+            g_sessions[slot].state.input_active = 1;
+            g_sessions[slot].state.last_input_packet_at_ms = now_ms();
         }
     }
     pthread_mutex_unlock(&g_sessions_mu);
     return slot;
 }
 
+static int stream_input_age_ms(const char *streamid, long long now, long long *age_ms)
+{
+    if (!streamid || !streamid[0]) return -1;
+
+    int found = 0;
+    long long last_input_at = 0;
+
+    pthread_mutex_lock(&g_sessions_mu);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        if (!g_sessions[i].state.streamid[0]) continue;
+        if (strcmp(g_sessions[i].state.streamid, streamid) != 0) continue;
+        found = 1;
+        last_input_at = g_sessions[i].state.last_input_packet_at_ms;
+        break;
+    }
+    pthread_mutex_unlock(&g_sessions_mu);
+
+    if (!found) return -1;
+    if (last_input_at <= 0) last_input_at = now;
+    if (age_ms) *age_ms = now - last_input_at;
+    return 0;
+}
+
 static void remove_stream_state(int slot)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    memset(&g_stream_states[slot], 0, sizeof g_stream_states[slot]);
+    memset(&g_sessions[slot].state, 0, sizeof g_sessions[slot].state);
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -338,11 +472,11 @@ static void set_stream_output_connected(int slot, int connected)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    g_stream_states[slot].output_connected = connected;
+    g_sessions[slot].state.output_connected = connected;
     if (connected) {
-        g_stream_states[slot].retry_failures = 0;
-        g_stream_states[slot].last_error[0] = '\0';
-        g_stream_states[slot].last_error_at_ms = 0;
+        g_sessions[slot].state.retry_failures = 0;
+        g_sessions[slot].state.last_error[0] = '\0';
+        g_sessions[slot].state.last_error_at_ms = 0;
     }
     pthread_mutex_unlock(&g_sessions_mu);
 }
@@ -351,7 +485,7 @@ static void increment_stream_retry_failures(int slot)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    g_stream_states[slot].retry_failures++;
+    g_sessions[slot].state.retry_failures++;
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -359,7 +493,7 @@ static int get_stream_retry_failures(int slot)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return 0;
     pthread_mutex_lock(&g_sessions_mu);
-    int failures = g_stream_states[slot].retry_failures;
+    int failures = g_sessions[slot].state.retry_failures;
     pthread_mutex_unlock(&g_sessions_mu);
     return failures;
 }
@@ -377,7 +511,7 @@ static void record_stream_input_progress(int slot)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
-    g_stream_states[slot].last_input_packet_at_ms = now_ms();
+    g_sessions[slot].state.last_input_packet_at_ms = now_ms();
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -385,92 +519,111 @@ static void record_stream_forward_progress(int slot, int bytes)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS || bytes <= 0) return;
     pthread_mutex_lock(&g_sessions_mu);
-    g_stream_states[slot].forwarded_packets++;
-    g_stream_states[slot].forwarded_bytes += bytes;
-    g_stream_states[slot].last_packet_at_ms = now_ms();
+    g_sessions[slot].state.forwarded_packets++;
+    g_sessions[slot].state.forwarded_bytes += bytes;
+    g_sessions[slot].state.last_packet_at_ms = now_ms();
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static void update_stream_srt_counters(int slot, SRTSOCKET in_sock, SRTSOCKET out_sock, int force)
+static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_sock,
+                                       SRTSOCKET out_sock, int force)
 {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     long long now = now_ms();
     pthread_mutex_lock(&g_sessions_mu);
-    long long last = g_stream_states[slot].last_stats_at_ms;
+    long long last = g_sessions[slot].state.last_stats_at_ms;
     pthread_mutex_unlock(&g_sessions_mu);
     if (!force && last > 0 && now - last < 1000) return;
 
     SRT_TRACEBSTATS in_stats;
     memset(&in_stats, 0, sizeof in_stats);
-    int have_in = in_sock != SRT_INVALID_SOCK && srt_bstats(in_sock, &in_stats, 0) != SRT_ERROR;
+    int have_in = 0;
 
     int is_group_sock = in_sock != SRT_INVALID_SOCK && (in_sock & SRTGROUP_MASK);
     int group_member_count = 0;
     int have_group_member_stats = 0;
     double group_member_rtt_ms = 0.0;
-    if (is_group_sock) {
-        SRT_SOCKGROUPDATA members[MAX_GROUP_MEMBERS];
-        size_t member_count = MAX_GROUP_MEMBERS;
-        memset(members, 0, sizeof members);
-        if (srt_group_data(in_sock, members, &member_count) != SRT_ERROR) {
-            for (size_t i = 0; i < member_count; ++i) {
-                if (members[i].id == SRT_INVALID_SOCK) continue;
-                if (members[i].memberstate == SRT_GST_BROKEN) continue;
-                group_member_count++;
+    int have_out = 0;
+    SRT_TRACEBSTATS out_stats;
+    memset(&out_stats, 0, sizeof out_stats);
 
-                SRT_TRACEBSTATS member_stats;
-                memset(&member_stats, 0, sizeof member_stats);
-                if (srt_bstats(members[i].id, &member_stats, 0) == SRT_ERROR) continue;
-                if (member_stats.msRTT <= 0.0) continue;
+    pthread_mutex_lock(&g_session_threads_mu);
+    int tracker_valid = tracker_slot >= 0 && tracker_slot < MAX_ACTIVE_SESSIONS;
+    int can_read_in = tracker_valid && in_sock != SRT_INVALID_SOCK &&
+                      g_sessions[tracker_slot].active.in_use &&
+                      g_sessions[tracker_slot].active.input_sock == in_sock;
+    int can_read_out = tracker_valid && out_sock != SRT_INVALID_SOCK &&
+                       g_sessions[tracker_slot].active.in_use &&
+                       g_sessions[tracker_slot].active.output_sock == out_sock;
 
-                have_group_member_stats = 1;
-                if (member_stats.msRTT > group_member_rtt_ms) {
-                    group_member_rtt_ms = member_stats.msRTT;
+    if (can_read_in) {
+        have_in = srt_bstats(in_sock, &in_stats, 0) != SRT_ERROR;
+
+        if (is_group_sock) {
+            SRT_SOCKGROUPDATA members[MAX_GROUP_MEMBERS];
+            size_t member_count = MAX_GROUP_MEMBERS;
+            memset(members, 0, sizeof members);
+            if (srt_group_data(in_sock, members, &member_count) != SRT_ERROR) {
+                for (size_t i = 0; i < member_count; ++i) {
+                    if (members[i].id == SRT_INVALID_SOCK) continue;
+                    if (members[i].memberstate == SRT_GST_BROKEN) continue;
+                    group_member_count++;
+
+                    SRT_TRACEBSTATS member_stats;
+                    memset(&member_stats, 0, sizeof member_stats);
+                    if (srt_bstats(members[i].id, &member_stats, 0) == SRT_ERROR) continue;
+                    if (member_stats.msRTT <= 0.0) continue;
+
+                    have_group_member_stats = 1;
+                    if (member_stats.msRTT > group_member_rtt_ms) {
+                        group_member_rtt_ms = member_stats.msRTT;
+                    }
                 }
             }
         }
     }
 
-    SRT_TRACEBSTATS out_stats;
-    memset(&out_stats, 0, sizeof out_stats);
-    int have_out = out_sock != SRT_INVALID_SOCK && srt_bstats(out_sock, &out_stats, 0) != SRT_ERROR;
+    if (can_read_out) {
+        have_out = srt_bstats(out_sock, &out_stats, 0) != SRT_ERROR;
+    }
+    pthread_mutex_unlock(&g_session_threads_mu);
 
     pthread_mutex_lock(&g_sessions_mu);
     if (have_in) {
-        g_stream_states[slot].input_rtt_ms = in_stats.msRTT;
-        g_stream_states[slot].input_rtt_valid = in_stats.msRTT > 0.0;
-        g_stream_states[slot].recv_packets_total_valid =
+        g_sessions[slot].state.input_rtt_ms = in_stats.msRTT;
+        g_sessions[slot].state.input_rtt_valid = in_stats.msRTT > 0.0;
+        g_sessions[slot].state.recv_packets_total_valid =
             !(is_group_sock && in_stats.pktRecvTotal == 0 && in_stats.pktRecvUniqueTotal > 0);
-        g_stream_states[slot].recv_packets_total =
-            max_ll(g_stream_states[slot].recv_packets_total, in_stats.pktRecvTotal);
-        g_stream_states[slot].recv_unique_packets_total =
-            max_ll(g_stream_states[slot].recv_unique_packets_total, in_stats.pktRecvUniqueTotal);
-        g_stream_states[slot].recv_loss_total =
-            max_int(g_stream_states[slot].recv_loss_total, in_stats.pktRcvLossTotal);
-        g_stream_states[slot].recv_drop_total =
-            max_int(g_stream_states[slot].recv_drop_total, in_stats.pktRcvDropTotal);
-        g_stream_states[slot].retrans_total =
-            max_int(g_stream_states[slot].retrans_total, in_stats.pktRcvRetrans);
+        g_sessions[slot].state.recv_packets_total =
+            max_ll(g_sessions[slot].state.recv_packets_total, in_stats.pktRecvTotal);
+        g_sessions[slot].state.recv_unique_packets_total =
+            max_ll(g_sessions[slot].state.recv_unique_packets_total, in_stats.pktRecvUniqueTotal);
+        g_sessions[slot].state.recv_loss_total =
+            max_int(g_sessions[slot].state.recv_loss_total, in_stats.pktRcvLossTotal);
+        g_sessions[slot].state.recv_drop_total =
+            max_int(g_sessions[slot].state.recv_drop_total, in_stats.pktRcvDropTotal);
+        g_sessions[slot].state.retrans_total =
+            max_int(g_sessions[slot].state.retrans_total, in_stats.pktRcvRetrans);
     }
     if (have_out) {
-        g_stream_states[slot].output_rtt_ms = out_stats.msRTT;
-        g_stream_states[slot].output_rtt_valid = out_stats.msRTT > 0.0;
+        g_sessions[slot].state.output_rtt_ms = out_stats.msRTT;
+        g_sessions[slot].state.output_rtt_valid = out_stats.msRTT > 0.0;
     }
-    g_stream_states[slot].group_member_count = group_member_count;
+    g_sessions[slot].state.group_member_count = group_member_count;
     if (have_group_member_stats) {
-        g_stream_states[slot].rtt_ms = group_member_rtt_ms;
-        g_stream_states[slot].rtt_valid = 1;
+        g_sessions[slot].state.rtt_ms = group_member_rtt_ms;
+        g_sessions[slot].state.rtt_valid = 1;
     } else if (is_group_sock) {
-        g_stream_states[slot].rtt_valid = 0;
+        g_sessions[slot].state.rtt_valid = 0;
     } else if (have_in) {
-        g_stream_states[slot].rtt_ms = in_stats.msRTT;
-        g_stream_states[slot].rtt_valid = in_stats.msRTT > 0.0;
+        g_sessions[slot].state.rtt_ms = in_stats.msRTT;
+        g_sessions[slot].state.rtt_valid = in_stats.msRTT > 0.0;
     } else if (have_out) {
-        g_stream_states[slot].rtt_ms = out_stats.msRTT;
-        g_stream_states[slot].rtt_valid = out_stats.msRTT > 0.0;
+        g_sessions[slot].state.rtt_ms = out_stats.msRTT;
+        g_sessions[slot].state.rtt_valid = out_stats.msRTT > 0.0;
     }
-    g_stream_states[slot].last_stats_at_ms = now;
+    g_sessions[slot].state.last_stats_at_ms = now;
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -487,7 +640,9 @@ static void write_status_response(int client_fd)
     long long updated_at_ms = now_ms();
 
     pthread_mutex_lock(&g_sessions_mu);
-    memcpy(states, g_stream_states, sizeof states);
+    for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        states[i] = g_sessions[i].state;
+    }
     memcpy(last_error, g_last_error, sizeof last_error);
     pthread_mutex_unlock(&g_sessions_mu);
 
@@ -943,7 +1098,7 @@ static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz)
     return sid_len > 0;
 }
 
-static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid)
+static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid, int tracker_slot)
 {
     SRTSOCKET srt_out = srt_create_socket();
     if (srt_out == SRT_INVALID_SOCK) {
@@ -951,6 +1106,7 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
         fprintf(stderr, "srt_create_socket(out): %s\n", srt_getlasterror_str());
         return SRT_INVALID_SOCK;
     }
+    set_tracked_session_output_socket(tracker_slot, srt_out);
 
     SRT_TRANSTYPE tt = SRTT_LIVE;
     srt_setsockflag(srt_out, SRTO_TRANSTYPE, &tt, sizeof tt);
@@ -966,7 +1122,12 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
     if (srt_connect(srt_out, (struct sockaddr *)&cfg->out_addr, (int)cfg->out_addrlen) == SRT_ERROR) {
         set_last_errorf("srt_connect: %s", srt_getlasterror_str());
         fprintf(stderr, "srt_connect: %s\n", srt_getlasterror_str());
-        srt_close(srt_out);
+        if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
+            srt_close(srt_out);
+        }
+        return SRT_INVALID_SOCK;
+    }
+    if (!tracked_socket_is_current(tracker_slot, SRT_INVALID_SOCK, srt_out)) {
         return SRT_INVALID_SOCK;
     }
 
@@ -974,9 +1135,10 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 }
 
 static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const char *streamid,
-                                               int state_slot, long long *next_retry_at_ms)
+                                               int state_slot, int tracker_slot,
+                                               long long *next_retry_at_ms)
 {
-    SRTSOCKET srt_out = connect_srt_output(cfg, streamid);
+    SRTSOCKET srt_out = connect_srt_output(cfg, streamid, tracker_slot);
     if (srt_out != SRT_INVALID_SOCK) {
         set_stream_output_connected(state_slot, 1);
         if (next_retry_at_ms) *next_retry_at_ms = 0;
@@ -1006,18 +1168,51 @@ static void *session_main(void *arg)
             streamid[0] = '\0';
         }
     }
+    set_tracked_session_streamid(tracker_slot, streamid);
 
     fprintf(stderr, "Accepted bonded SRT source streamid=%s\n", streamid[0] ? streamid : "(empty)");
-    int state_slot = add_stream_state(streamid);
+    int state_slot = claim_stream_state(streamid, tracker_slot);
     int udp_fd = -1;
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
 
-    /* A bonded SRT group is one accepted publisher session; duplicate stream IDs here are
-     * separate accepted publisher sessions, not individual group members reconnecting. */
     if (state_slot == -2) {
-        set_last_errorf("Duplicate publisher rejected for streamid=%s", streamid);
-        fprintf(stderr, "Duplicate publisher rejected for streamid=%s\n", streamid);
+        long long deadline = now_ms() + DUPLICATE_TAKEOVER_WAIT_MS;
+        int takeover_started = 0;
+        do {
+            long long now = now_ms();
+            long long input_age_ms = 0;
+            int stream_present = stream_input_age_ms(streamid, now, &input_age_ms) == 0;
+
+            if (!stream_present) {
+                state_slot = claim_stream_state(streamid, tracker_slot);
+                if (state_slot != -2) break;
+            } else if (input_age_ms >= DUPLICATE_TAKEOVER_STALE_MS) {
+                if (!takeover_started) {
+                    set_last_errorf("Duplicate publisher takeover for stale streamid=%s", streamid);
+                    fprintf(stderr, "Duplicate publisher takeover for stale streamid=%s\n", streamid);
+                    close_tracked_sessions_for_streamid(streamid, tracker_slot);
+                    takeover_started = 1;
+                }
+                state_slot = claim_stream_state(streamid, tracker_slot);
+                if (state_slot != -2) break;
+            }
+
+            struct timespec ts;
+            ts.tv_sec = 0;
+            ts.tv_nsec = 50 * 1000 * 1000;
+            nanosleep(&ts, NULL);
+        } while (g_running && state_slot == -2 && now_ms() < deadline);
+
+        if (state_slot == -2) {
+            set_last_errorf("Duplicate publisher rejected for active streamid=%s", streamid);
+            fprintf(stderr, "Duplicate publisher rejected for active streamid=%s\n", streamid);
+            goto cleanup;
+        }
+    }
+    if (state_slot < 0 && streamid[0]) {
+        set_last_errorf("No stream state slot available for streamid=%s", streamid);
+        fprintf(stderr, "No stream state slot available for streamid=%s\n", streamid);
         goto cleanup;
     }
 
@@ -1031,14 +1226,17 @@ static void *session_main(void *arg)
             goto cleanup;
         }
     } else {
-        srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, &next_output_retry_at_ms);
+        srt_out =
+            connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                          &next_output_retry_at_ms);
     }
 
     char buf[CHUNK];
     while (g_running && stream_input_still_connected(conn)) {
         if (!cfg->udp_out && srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
             srt_out =
-                connect_srt_output_with_retry(cfg, streamid, state_slot, &next_output_retry_at_ms);
+                connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                              &next_output_retry_at_ms);
         }
 
         SRT_MSGCTRL mc = srt_msgctrl_default;
@@ -1054,7 +1252,7 @@ static void *session_main(void *arg)
         }
         if (r <= 0) continue;
         record_stream_input_progress(state_slot);
-        update_stream_srt_counters(state_slot, conn, srt_out, 0);
+        update_stream_srt_counters(state_slot, tracker_slot, conn, srt_out, 0);
 
         if (udp_fd >= 0) {
             sendto(udp_fd, buf, (size_t)r, 0, (struct sockaddr *)&cfg->out_addr, cfg->out_addrlen);
@@ -1064,7 +1262,9 @@ static void *session_main(void *arg)
                 set_stream_errorf(state_slot, "Relay output error: %s", srt_getlasterror_str());
                 set_stream_output_connected(state_slot, 0);
                 fprintf(stderr, "srt_sendmsg2: %s\n", srt_getlasterror_str());
-                srt_close(srt_out);
+                if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
+                    srt_close(srt_out);
+                }
                 srt_out = SRT_INVALID_SOCK;
                 next_output_retry_at_ms = now_ms();
                 continue;
@@ -1074,37 +1274,50 @@ static void *session_main(void *arg)
     }
 
     if (udp_fd >= 0) close(udp_fd);
-    update_stream_srt_counters(state_slot, conn, srt_out, 1);
-    if (srt_out != SRT_INVALID_SOCK) srt_close(srt_out);
+    update_stream_srt_counters(state_slot, tracker_slot, conn, srt_out, 1);
+    if (srt_out != SRT_INVALID_SOCK &&
+        take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
+        srt_close(srt_out);
+    }
     remove_stream_state(state_slot);
     fprintf(stderr, "Connection closed streamid=%s\n", streamid[0] ? streamid : "(empty)");
 
 cleanup:
-    if (take_tracked_session_socket(tracker_slot) != SRT_INVALID_SOCK) {
+    if (take_tracked_input_socket(tracker_slot, conn) != SRT_INVALID_SOCK) {
         srt_close(conn);
     }
     unregister_session_thread(tracker_slot);
     return NULL;
 }
 
-static int resolve_output(const char *host, int port, relay_config_t *cfg)
+static int resolve_ipv4_addr(const char *host, int port, int ai_flags, const char *context,
+                             struct sockaddr_storage *addr, socklen_t *addrlen)
 {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
     memset(&hints, 0, sizeof hints);
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = ai_flags;
 
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
-    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) {
-        fprintf(stderr, "getaddrinfo failed for %s:%d\n", host, port);
+    int rc = getaddrinfo(host, portstr, &hints, &res);
+    if (rc != 0 || !res) {
+        fprintf(stderr, "getaddrinfo failed for %s %s:%d: %s\n", context, host, port,
+                rc == 0 ? "no address" : gai_strerror(rc));
         return -1;
     }
-    cfg->out_addrlen = (socklen_t)res->ai_addrlen;
-    memcpy(&cfg->out_addr, res->ai_addr, res->ai_addrlen);
+
+    *addrlen = (socklen_t)res->ai_addrlen;
+    memcpy(addr, res->ai_addr, res->ai_addrlen);
     freeaddrinfo(res);
     return 0;
+}
+
+static int resolve_output(const char *host, int port, relay_config_t *cfg)
+{
+    return resolve_ipv4_addr(host, port, 0, "output", &cfg->out_addr, &cfg->out_addrlen);
 }
 
 static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_in *sa)
@@ -1118,25 +1331,14 @@ static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_i
         return 0;
     }
 
-    struct addrinfo hints;
-    struct addrinfo *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_PASSIVE;
-
-    char portstr[16];
-    snprintf(portstr, sizeof portstr, "%d", port);
-    int rc = getaddrinfo(host, portstr, &hints, &res);
-    if (rc != 0 || !res) {
-        fprintf(stderr, "getaddrinfo failed for input %s:%d: %s\n", host, port,
-                rc == 0 ? "no address" : gai_strerror(rc));
+    struct sockaddr_storage resolved;
+    socklen_t resolved_len = 0;
+    if (resolve_ipv4_addr(host, port, AI_PASSIVE, "input", &resolved, &resolved_len) < 0) {
         return -1;
     }
 
-    struct sockaddr_in *resolved = (struct sockaddr_in *)res->ai_addr;
-    memcpy(sa, resolved, sizeof *sa);
-    freeaddrinfo(res);
+    (void)resolved_len;
+    memcpy(sa, &resolved, sizeof *sa);
     return 0;
 }
 
