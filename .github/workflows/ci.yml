@@ -13,5 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y clang-format
+      - run: bash scripts/format.sh check
       - run: bash scripts/smoke-test.sh
-

@@ -7,7 +7,11 @@ IMAGE_TAG="srt-bonding-relay-dev:${SRT_TAG}"
 CONTAINER_NAME="srt-bonding-relay-dev-$$"
 OUT_BIN="${SRT_BONDING_RELAY_PATH:-$REPO_DIR/objs/srt-bonding-relay}"
 OUT_LIB_DIR="${SRT_BONDING_RELAY_LIB_DIR:-$REPO_DIR/objs/lib}"
-SOURCE_SHA="$(sha256sum "$REPO_DIR/src/srt-bonding-relay.c" | awk '{print $1}')"
+SOURCE_SHA="$(find "$REPO_DIR/src" -type f \( -name '*.c' -o -name '*.h' \) -print0 \
+    | sort -z \
+    | xargs -0 sha256sum \
+    | sha256sum \
+    | awk '{print $1}')"
 VERSION_FILE="$REPO_DIR/VERSION"
 
 if [[ ! -f "$VERSION_FILE" ]]; then

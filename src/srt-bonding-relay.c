@@ -41,6 +41,8 @@
 
 #include <srt/srt.h>
 
+#include "relay_config.h"
+
 #define CHUNK 1456
 #define LISTEN_BACKLOG 64
 #define MAX_EVENTS 16
@@ -106,14 +108,12 @@ static int g_active_session_threads = 0;
 static long long g_started_at_ms = 0;
 static int g_status_port = 8081;
 
-static void on_signal(int s)
-{
+static void on_signal(int s) {
     (void)s;
     g_running = 0;
 }
 
-static int install_signal_handlers(void)
-{
+static int install_signal_handlers(void) {
     struct sigaction stop_sa;
     memset(&stop_sa, 0, sizeof stop_sa);
     stop_sa.sa_handler = on_signal;
@@ -131,8 +131,7 @@ static int install_signal_handlers(void)
     return 0;
 }
 
-static void init_session_tracking(void)
-{
+static void init_session_tracking(void) {
     pthread_mutex_lock(&g_session_threads_mu);
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
         memset(&g_sessions[i].active, 0, sizeof g_sessions[i].active);
@@ -143,8 +142,7 @@ static void init_session_tracking(void)
     pthread_mutex_unlock(&g_session_threads_mu);
 }
 
-static int register_session_thread(SRTSOCKET conn)
-{
+static int register_session_thread(SRTSOCKET conn) {
     int slot = -1;
 
     pthread_mutex_lock(&g_session_threads_mu);
@@ -164,8 +162,7 @@ static int register_session_thread(SRTSOCKET conn)
     return slot;
 }
 
-static void set_tracked_session_streamid(int slot, const char *streamid)
-{
+static void set_tracked_session_streamid(int slot, const char *streamid) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     pthread_mutex_lock(&g_session_threads_mu);
@@ -180,8 +177,7 @@ static void set_tracked_session_streamid(int slot, const char *streamid)
     pthread_mutex_unlock(&g_session_threads_mu);
 }
 
-static void set_tracked_session_output_socket(int slot, SRTSOCKET sock)
-{
+static void set_tracked_session_output_socket(int slot, SRTSOCKET sock) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     pthread_mutex_lock(&g_session_threads_mu);
@@ -191,8 +187,7 @@ static void set_tracked_session_output_socket(int slot, SRTSOCKET sock)
     pthread_mutex_unlock(&g_session_threads_mu);
 }
 
-static SRTSOCKET take_tracked_input_socket(int slot, SRTSOCKET expected)
-{
+static SRTSOCKET take_tracked_input_socket(int slot, SRTSOCKET expected) {
     SRTSOCKET sock = SRT_INVALID_SOCK;
 
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return SRT_INVALID_SOCK;
@@ -207,8 +202,7 @@ static SRTSOCKET take_tracked_input_socket(int slot, SRTSOCKET expected)
     return sock;
 }
 
-static SRTSOCKET take_tracked_output_socket(int slot, SRTSOCKET expected)
-{
+static SRTSOCKET take_tracked_output_socket(int slot, SRTSOCKET expected) {
     SRTSOCKET sock = SRT_INVALID_SOCK;
 
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return SRT_INVALID_SOCK;
@@ -223,8 +217,7 @@ static SRTSOCKET take_tracked_output_socket(int slot, SRTSOCKET expected)
     return sock;
 }
 
-static int tracked_socket_is_current(int slot, SRTSOCKET input_sock, SRTSOCKET output_sock)
-{
+static int tracked_socket_is_current(int slot, SRTSOCKET input_sock, SRTSOCKET output_sock) {
     int current = 0;
 
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return 0;
@@ -240,8 +233,7 @@ static int tracked_socket_is_current(int slot, SRTSOCKET input_sock, SRTSOCKET o
     return current;
 }
 
-static void close_tracked_sessions_for_streamid(const char *streamid, int except_slot)
-{
+static void close_tracked_sessions_for_streamid(const char *streamid, int except_slot) {
     SRTSOCKET sockets[MAX_ACTIVE_SESSIONS * 2];
     int count = 0;
 
@@ -268,8 +260,7 @@ static void close_tracked_sessions_for_streamid(const char *streamid, int except
     }
 }
 
-static void unregister_session_thread(int slot)
-{
+static void unregister_session_thread(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     pthread_mutex_lock(&g_session_threads_mu);
@@ -283,8 +274,7 @@ static void unregister_session_thread(int slot)
     pthread_mutex_unlock(&g_session_threads_mu);
 }
 
-static void close_active_session_sockets(void)
-{
+static void close_active_session_sockets(void) {
     SRTSOCKET sockets[MAX_ACTIVE_SESSIONS * 2];
     int count = 0;
 
@@ -307,8 +297,7 @@ static void close_active_session_sockets(void)
     }
 }
 
-static void wait_for_session_threads(void)
-{
+static void wait_for_session_threads(void) {
     pthread_mutex_lock(&g_session_threads_mu);
     while (g_active_session_threads > 0) {
         pthread_cond_wait(&g_session_threads_cond, &g_session_threads_mu);
@@ -329,24 +318,13 @@ typedef struct session_args {
     int tracker_slot;
 } session_args_t;
 
-typedef struct file_config {
-    char input_host[256];
-    int input_port;
-    char output_host[256];
-    int output_port;
-    int status_port;
-    char passphrase[256];
-} file_config_t;
-
-static long long now_ms(void)
-{
+static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
-static void json_write_escaped(FILE *f, const char *s)
-{
+static void json_write_escaped(FILE *f, const char *s) {
     for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
         switch (*p) {
         case '\\':
@@ -375,8 +353,7 @@ static void json_write_escaped(FILE *f, const char *s)
     }
 }
 
-static void set_last_errorf(const char *fmt, ...)
-{
+static void set_last_errorf(const char *fmt, ...) {
     pthread_mutex_lock(&g_sessions_mu);
     va_list ap;
     va_start(ap, fmt);
@@ -385,8 +362,7 @@ static void set_last_errorf(const char *fmt, ...)
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static void set_stream_errorf(int slot, const char *fmt, ...)
-{
+static void set_stream_errorf(int slot, const char *fmt, ...) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     va_list ap;
@@ -397,18 +373,15 @@ static void set_stream_errorf(int slot, const char *fmt, ...)
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static long long max_ll(long long a, long long b)
-{
+static long long max_ll(long long a, long long b) {
     return a > b ? a : b;
 }
 
-static int max_int(int a, int b)
-{
+static int max_int(int a, int b) {
     return a > b ? a : b;
 }
 
-static int claim_stream_state(const char *streamid, int preferred_slot)
-{
+static int claim_stream_state(const char *streamid, int preferred_slot) {
     if (!streamid || !streamid[0]) return -1;
     pthread_mutex_lock(&g_sessions_mu);
     int slot = -1;
@@ -437,8 +410,7 @@ static int claim_stream_state(const char *streamid, int preferred_slot)
     return slot;
 }
 
-static int stream_input_age_ms(const char *streamid, long long now, long long *age_ms)
-{
+static int stream_input_age_ms(const char *streamid, long long now, long long *age_ms) {
     if (!streamid || !streamid[0]) return -1;
 
     int found = 0;
@@ -460,16 +432,14 @@ static int stream_input_age_ms(const char *streamid, long long now, long long *a
     return 0;
 }
 
-static void remove_stream_state(int slot)
-{
+static void remove_stream_state(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     memset(&g_sessions[slot].state, 0, sizeof g_sessions[slot].state);
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static void set_stream_output_connected(int slot, int connected)
-{
+static void set_stream_output_connected(int slot, int connected) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.output_connected = connected;
@@ -481,16 +451,14 @@ static void set_stream_output_connected(int slot, int connected)
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static void increment_stream_retry_failures(int slot)
-{
+static void increment_stream_retry_failures(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.retry_failures++;
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static int get_stream_retry_failures(int slot)
-{
+static int get_stream_retry_failures(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return 0;
     pthread_mutex_lock(&g_sessions_mu);
     int failures = g_sessions[slot].state.retry_failures;
@@ -498,8 +466,7 @@ static int get_stream_retry_failures(int slot)
     return failures;
 }
 
-static int get_retry_delay_ms(int failures)
-{
+static int get_retry_delay_ms(int failures) {
     int idx = failures - 1;
     if (idx < 0) idx = 0;
     int max_idx = (int)(sizeof RETRY_DELAYS_MS / sizeof RETRY_DELAYS_MS[0]) - 1;
@@ -507,16 +474,14 @@ static int get_retry_delay_ms(int failures)
     return RETRY_DELAYS_MS[idx];
 }
 
-static void record_stream_input_progress(int slot)
-{
+static void record_stream_input_progress(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.last_input_packet_at_ms = now_ms();
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static void record_stream_forward_progress(int slot, int bytes)
-{
+static void record_stream_forward_progress(int slot, int bytes) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS || bytes <= 0) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.forwarded_packets++;
@@ -526,8 +491,7 @@ static void record_stream_forward_progress(int slot, int bytes)
 }
 
 static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_sock,
-                                       SRTSOCKET out_sock, int force)
-{
+                                       SRTSOCKET out_sock, int force) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     long long now = now_ms();
@@ -627,14 +591,12 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
-static int stream_input_still_connected(SRTSOCKET conn)
-{
+static int stream_input_still_connected(SRTSOCKET conn) {
     SRT_SOCKSTATUS st = srt_getsockstate(conn);
     return st == SRTS_CONNECTED || st == SRTS_LISTENING || st == SRTS_CONNECTING;
 }
 
-static void write_status_response(int client_fd)
-{
+static void write_status_response(int client_fd) {
     relay_stream_state_t states[MAX_ACTIVE_SESSIONS];
     char last_error[sizeof g_last_error];
     long long updated_at_ms = now_ms();
@@ -665,9 +627,7 @@ static void write_status_response(int client_fd)
             "  \"startedAtMs\": %lld,\n"
             "  \"updatedAtMs\": %lld,\n"
             "  \"lastError\": ",
-            (long)getpid(),
-            g_started_at_ms,
-            updated_at_ms);
+            (long)getpid(), g_started_at_ms, updated_at_ms);
     if (last_error[0]) {
         fputc('"', f);
         json_write_escaped(f, last_error);
@@ -693,13 +653,13 @@ static void write_status_response(int client_fd)
         fprintf(f, "%s\n    {\n      \"streamId\": \"", first ? "\n" : ",\n");
         json_write_escaped(f, states[i].streamid);
         fprintf(f,
-                "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      \"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      \"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      \"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": ",
+                "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      "
+                "\"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      "
+                "\"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      "
+                "\"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": ",
                 states[i].input_active ? "true" : "false",
-                states[i].output_connected ? "true" : "false",
-                states[i].retry_failures,
-                states[i].forwarded_packets,
-                states[i].forwarded_bytes,
-                states[i].last_packet_at_ms,
+                states[i].output_connected ? "true" : "false", states[i].retry_failures,
+                states[i].forwarded_packets, states[i].forwarded_bytes, states[i].last_packet_at_ms,
                 states[i].last_input_packet_at_ms);
         if (states[i].recv_packets_total_valid) {
             fprintf(f, "%lld", states[i].recv_packets_total);
@@ -707,11 +667,10 @@ static void write_status_response(int client_fd)
             fputs("null", f);
         }
         fprintf(f,
-                ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      \"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": ",
-                states[i].recv_unique_packets_total,
-                states[i].recv_loss_total,
-                states[i].recv_drop_total,
-                states[i].retrans_total);
+                ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      "
+                "\"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": ",
+                states[i].recv_unique_packets_total, states[i].recv_loss_total,
+                states[i].recv_drop_total, states[i].retrans_total);
         if (states[i].rtt_valid) {
             fprintf(f, "%.3f", states[i].rtt_ms);
         } else {
@@ -730,9 +689,9 @@ static void write_status_response(int client_fd)
             fputs("null", f);
         }
         fprintf(f,
-                ",\n      \"groupMemberCount\": %d,\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
-                states[i].group_member_count,
-                states[i].last_error_at_ms);
+                ",\n      \"groupMemberCount\": %d,\n      \"lastErrorAt\": %lld,\n      "
+                "\"lastError\": ",
+                states[i].group_member_count, states[i].last_error_at_ms);
         if (states[i].last_error[0]) {
             fputc('"', f);
             json_write_escaped(f, states[i].last_error);
@@ -746,8 +705,7 @@ static void write_status_response(int client_fd)
     fclose(f);
 }
 
-static void *status_http_main(void *arg)
-{
+static void *status_http_main(void *arg) {
     (void)arg;
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -808,257 +766,7 @@ static void *status_http_main(void *arg)
     return NULL;
 }
 
-static int parse_uri(const char *uri,
-                     char *scheme, size_t scheme_sz,
-                     char *host, size_t host_sz,
-                     int *port,
-                     char *query, size_t query_sz)
-{
-    const char *p = strstr(uri, "://");
-    if (!p) return -1;
-
-    size_t slen = (size_t)(p - uri);
-    if (slen >= scheme_sz) return -1;
-    memcpy(scheme, uri, slen);
-    scheme[slen] = '\0';
-    p += 3;
-
-    const char *qmark = strchr(p, '?');
-    const char *host_end = qmark ? qmark : p + strlen(p);
-    const char *colon = NULL;
-    for (const char *c = host_end; c > p; --c) {
-        if (*(c - 1) == ':') {
-            colon = c - 1;
-            break;
-        }
-    }
-    if (!colon) return -1;
-
-    size_t hlen = (size_t)(colon - p);
-    if (hlen >= host_sz) hlen = host_sz - 1;
-    memcpy(host, p, hlen);
-    host[hlen] = '\0';
-
-    char portbuf[16];
-    size_t plen = (size_t)(host_end - colon - 1);
-    if (plen == 0 || plen >= sizeof portbuf) return -1;
-    memcpy(portbuf, colon + 1, plen);
-    portbuf[plen] = '\0';
-    *port = atoi(portbuf);
-    if (*port <= 0 || *port > 65535) return -1;
-
-    if (query && query_sz > 0) {
-        query[0] = '\0';
-        if (qmark) {
-            size_t qlen = strlen(qmark + 1);
-            if (qlen >= query_sz) qlen = query_sz - 1;
-            memcpy(query, qmark + 1, qlen);
-            query[qlen] = '\0';
-        }
-    }
-    return 0;
-}
-
-static int get_param(const char *query, const char *key, char *val, size_t val_sz)
-{
-    size_t klen = strlen(key);
-    const char *p = query;
-    while (p && *p) {
-        if (strncmp(p, key, klen) == 0 && p[klen] == '=') {
-            const char *v = p + klen + 1;
-            const char *end = strchr(v, '&');
-            size_t vlen = end ? (size_t)(end - v) : strlen(v);
-            if (vlen >= val_sz) vlen = val_sz - 1;
-            memcpy(val, v, vlen);
-            val[vlen] = '\0';
-            char *src = val;
-            char *dst = val;
-            while (*src) {
-                if (src[0] == '%' &&
-                    ((src[1] >= '0' && src[1] <= '9') || (src[1] >= 'A' && src[1] <= 'F') ||
-                     (src[1] >= 'a' && src[1] <= 'f')) &&
-                    ((src[2] >= '0' && src[2] <= '9') || (src[2] >= 'A' && src[2] <= 'F') ||
-                     (src[2] >= 'a' && src[2] <= 'f'))) {
-                    char hex[3];
-                    hex[0] = src[1];
-                    hex[1] = src[2];
-                    hex[2] = '\0';
-                    *dst++ = (char)strtol(hex, NULL, 16);
-                    src += 3;
-                    continue;
-                }
-                *dst++ = *src++;
-            }
-            *dst = '\0';
-            return 1;
-        }
-        p = strchr(p, '&');
-        if (p) ++p;
-    }
-    return 0;
-}
-
-static const char *skip_ws(const char *p)
-{
-    while (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') ++p;
-    return p;
-}
-
-static int json_get_string(const char *json, const char *key, char *out, size_t out_sz)
-{
-    char needle[128];
-    snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return 0;
-    p = strchr(p + strlen(needle), ':');
-    if (!p) return 0;
-    p = skip_ws(p + 1);
-    if (*p != '"') return 0;
-    ++p;
-
-    size_t len = 0;
-    while (*p && *p != '"') {
-        if (*p == '\\' && p[1]) ++p;
-        if (len + 1 >= out_sz) return 0;
-        out[len++] = *p++;
-    }
-    if (*p != '"') return 0;
-    out[len] = '\0';
-    return 1;
-}
-
-static int json_get_int(const char *json, const char *key, int *out)
-{
-    char needle[128];
-    snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *p = strstr(json, needle);
-    if (!p) return 0;
-    p = strchr(p + strlen(needle), ':');
-    if (!p) return 0;
-    p = skip_ws(p + 1);
-    char *end = NULL;
-    long v = strtol(p, &end, 10);
-    if (end == p) return 0;
-    *out = (int)v;
-    return 1;
-}
-
-static void append_param(char *buf, size_t buf_sz, int *first, const char *key, const char *value)
-{
-    size_t used = strlen(buf);
-    if (used >= buf_sz) return;
-    snprintf(buf + used, buf_sz - used, "%s%s=%s", *first ? "?" : "&", key, value);
-    *first = 0;
-}
-
-static void append_param_int(char *buf, size_t buf_sz, int *first, const char *key, int value)
-{
-    char tmp[32];
-    snprintf(tmp, sizeof tmp, "%d", value);
-    append_param(buf, buf_sz, first, key, tmp);
-}
-
-static int uri_is_unreserved(unsigned char c)
-{
-    return (c >= 'A' && c <= 'Z') ||
-           (c >= 'a' && c <= 'z') ||
-           (c >= '0' && c <= '9') ||
-           c == '-' || c == '.' || c == '_' || c == '~';
-}
-
-static int url_encode_component(const char *in, char *out, size_t out_sz)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    size_t used = 0;
-
-    for (const unsigned char *p = (const unsigned char *)in; *p; ++p) {
-        if (uri_is_unreserved(*p)) {
-            if (used + 1 >= out_sz) return -1;
-            out[used++] = (char)*p;
-        } else {
-            if (used + 3 >= out_sz) return -1;
-            out[used++] = '%';
-            out[used++] = hex[*p >> 4];
-            out[used++] = hex[*p & 0x0f];
-        }
-    }
-
-    if (used >= out_sz) return -1;
-    out[used] = '\0';
-    return 0;
-}
-
-static int build_srt_uri(char *out, size_t out_sz, const char *host, int port, const char *passphrase,
-                         int include_groupconnect)
-{
-    snprintf(out, out_sz, "srt://%s:%d", host, port);
-    int first = 1;
-    append_param(out, out_sz, &first, "mode", include_groupconnect ? "listener" : "caller");
-    if (include_groupconnect) append_param_int(out, out_sz, &first, "groupconnect", 1);
-    append_param(out, out_sz, &first, "transtype", "live");
-    append_param_int(out, out_sz, &first, "latency", include_groupconnect ? 240 : 200);
-    if (passphrase && passphrase[0]) {
-        char encoded_passphrase[sizeof(((file_config_t *)0)->passphrase) * 3];
-        if (url_encode_component(passphrase, encoded_passphrase, sizeof encoded_passphrase) != 0) return -1;
-        append_param(out, out_sz, &first, "passphrase", encoded_passphrase);
-        append_param_int(out, out_sz, &first, "pbkeylen", 16);
-    }
-    return 0;
-}
-
-static int read_file(const char *path, char **buf_out, size_t *len_out)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) return -1;
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        return -1;
-    }
-    long len = ftell(f);
-    if (len < 0) {
-        fclose(f);
-        return -1;
-    }
-    rewind(f);
-    char *buf = (char *)calloc((size_t)len + 1, 1);
-    if (!buf) {
-        fclose(f);
-        return -1;
-    }
-    if (fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        free(buf);
-        fclose(f);
-        return -1;
-    }
-    fclose(f);
-    buf[len] = '\0';
-    *buf_out = buf;
-    if (len_out) *len_out = (size_t)len;
-    return 0;
-}
-
-static int load_config_file(const char *path, file_config_t *cfg)
-{
-    char *json = NULL;
-    if (read_file(path, &json, NULL) != 0) return -1;
-
-    memset(cfg, 0, sizeof *cfg);
-    int ok = json_get_string(json, "input_host", cfg->input_host, sizeof cfg->input_host) &&
-             json_get_int(json, "input_port", &cfg->input_port) &&
-             json_get_string(json, "output_host", cfg->output_host, sizeof cfg->output_host) &&
-             json_get_int(json, "output_port", &cfg->output_port) &&
-             json_get_int(json, "status_port", &cfg->status_port) &&
-             json_get_string(json, "passphrase", cfg->passphrase, sizeof cfg->passphrase);
-    free(json);
-    if (!ok) return -1;
-    if (cfg->input_port <= 0 || cfg->input_port > 65535) return -1;
-    if (cfg->output_port <= 0 || cfg->output_port > 65535) return -1;
-    if (cfg->status_port <= 0 || cfg->status_port > 65535) return -1;
-    return 0;
-}
-
-static void apply_srt_opts(SRTSOCKET sock, const char *query)
-{
+static void apply_srt_opts(SRTSOCKET sock, const char *query) {
     char val[512];
 
     if (get_param(query, "transtype", val, sizeof val)) {
@@ -1086,8 +794,7 @@ static void apply_srt_opts(SRTSOCKET sock, const char *query)
     }
 }
 
-static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz)
-{
+static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz) {
     if (sid_sz == 0) return 0;
     sid[0] = '\0';
     int sid_len = (int)sid_sz - 1;
@@ -1098,8 +805,8 @@ static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz)
     return sid_len > 0;
 }
 
-static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid, int tracker_slot)
-{
+static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid,
+                                    int tracker_slot) {
     SRTSOCKET srt_out = srt_create_socket();
     if (srt_out == SRT_INVALID_SOCK) {
         set_last_errorf("srt_create_socket(out): %s", srt_getlasterror_str());
@@ -1119,7 +826,8 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
     int cto = 3000;
     srt_setsockflag(srt_out, SRTO_CONNTIMEO, &cto, sizeof cto);
 
-    if (srt_connect(srt_out, (struct sockaddr *)&cfg->out_addr, (int)cfg->out_addrlen) == SRT_ERROR) {
+    if (srt_connect(srt_out, (struct sockaddr *)&cfg->out_addr, (int)cfg->out_addrlen) ==
+        SRT_ERROR) {
         set_last_errorf("srt_connect: %s", srt_getlasterror_str());
         fprintf(stderr, "srt_connect: %s\n", srt_getlasterror_str());
         if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
@@ -1136,8 +844,7 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 
 static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const char *streamid,
                                                int state_slot, int tracker_slot,
-                                               long long *next_retry_at_ms)
-{
+                                               long long *next_retry_at_ms) {
     SRTSOCKET srt_out = connect_srt_output(cfg, streamid, tracker_slot);
     if (srt_out != SRT_INVALID_SOCK) {
         set_stream_output_connected(state_slot, 1);
@@ -1149,13 +856,13 @@ static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const 
     int failures = get_stream_retry_failures(state_slot);
     int delay_ms = get_retry_delay_ms(failures);
     set_stream_output_connected(state_slot, 0);
-    set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms", delay_ms);
+    set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
+                      delay_ms);
     if (next_retry_at_ms) *next_retry_at_ms = now_ms() + delay_ms;
     return SRT_INVALID_SOCK;
 }
 
-static void *session_main(void *arg)
-{
+static void *session_main(void *arg) {
     session_args_t *args = (session_args_t *)arg;
     SRTSOCKET conn = args->conn;
     const relay_config_t *cfg = args->cfg;
@@ -1190,7 +897,8 @@ static void *session_main(void *arg)
             } else if (input_age_ms >= DUPLICATE_TAKEOVER_STALE_MS) {
                 if (!takeover_started) {
                     set_last_errorf("Duplicate publisher takeover for stale streamid=%s", streamid);
-                    fprintf(stderr, "Duplicate publisher takeover for stale streamid=%s\n", streamid);
+                    fprintf(stderr, "Duplicate publisher takeover for stale streamid=%s\n",
+                            streamid);
                     close_tracked_sessions_for_streamid(streamid, tracker_slot);
                     takeover_started = 1;
                 }
@@ -1226,17 +934,15 @@ static void *session_main(void *arg)
             goto cleanup;
         }
     } else {
-        srt_out =
-            connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
-                                          &next_output_retry_at_ms);
+        srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                                &next_output_retry_at_ms);
     }
 
     char buf[CHUNK];
     while (g_running && stream_input_still_connected(conn)) {
         if (!cfg->udp_out && srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
-            srt_out =
-                connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
-                                              &next_output_retry_at_ms);
+            srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                                    &next_output_retry_at_ms);
         }
 
         SRT_MSGCTRL mc = srt_msgctrl_default;
@@ -1291,8 +997,7 @@ cleanup:
 }
 
 static int resolve_ipv4_addr(const char *host, int port, int ai_flags, const char *context,
-                             struct sockaddr_storage *addr, socklen_t *addrlen)
-{
+                             struct sockaddr_storage *addr, socklen_t *addrlen) {
     struct addrinfo hints;
     struct addrinfo *res = NULL;
     memset(&hints, 0, sizeof hints);
@@ -1315,13 +1020,11 @@ static int resolve_ipv4_addr(const char *host, int port, int ai_flags, const cha
     return 0;
 }
 
-static int resolve_output(const char *host, int port, relay_config_t *cfg)
-{
+static int resolve_output(const char *host, int port, relay_config_t *cfg) {
     return resolve_ipv4_addr(host, port, 0, "output", &cfg->out_addr, &cfg->out_addrlen);
 }
 
-static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_in *sa)
-{
+static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_in *sa) {
     memset(sa, 0, sizeof *sa);
     sa->sin_family = AF_INET;
     sa->sin_port = htons((unsigned short)port);
@@ -1342,10 +1045,8 @@ static int resolve_input_bind_addr(const char *host, int port, struct sockaddr_i
     return 0;
 }
 
-int main(int argc, char *argv[])
-{
-    if (argc == 2 &&
-        (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
+int main(int argc, char *argv[]) {
+    if (argc == 2 && (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)) {
         puts(RELAY_VERSION_STRING);
         return 0;
     }
@@ -1355,9 +1056,7 @@ int main(int argc, char *argv[])
                 "Usage: %s [--version]\n"
                 "   or: %s <config.json>\n"
                 "   or: %s <srt-input-uri> <output-uri>\n",
-                argv[0],
-                argv[0],
-                argv[0]);
+                argv[0], argv[0], argv[0]);
         return 1;
     }
 
@@ -1369,20 +1068,10 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Bad config file: %s\n", argv[1]);
             return 1;
         }
-        if (build_srt_uri(
-                input_uri,
-                sizeof input_uri,
-                file_cfg.input_host,
-                file_cfg.input_port,
-                file_cfg.passphrase,
-                1) != 0 ||
-            build_srt_uri(
-                output_uri,
-                sizeof output_uri,
-                file_cfg.output_host,
-                file_cfg.output_port,
-                file_cfg.passphrase,
-                0) != 0) {
+        if (build_srt_uri(input_uri, sizeof input_uri, file_cfg.input_host, file_cfg.input_port,
+                          file_cfg.passphrase, 1) != 0 ||
+            build_srt_uri(output_uri, sizeof output_uri, file_cfg.output_host, file_cfg.output_port,
+                          file_cfg.passphrase, 0) != 0) {
             fprintf(stderr, "Bad config file: failed to build SRT URI\n");
             return 1;
         }
@@ -1400,8 +1089,8 @@ int main(int argc, char *argv[])
     char out_scheme[8], out_host[256], out_query[1024];
     int in_port, out_port;
 
-    if (parse_uri(input_uri, in_scheme, sizeof in_scheme, in_host, sizeof in_host, &in_port, in_query,
-                  sizeof in_query) < 0) {
+    if (parse_uri(input_uri, in_scheme, sizeof in_scheme, in_host, sizeof in_host, &in_port,
+                  in_query, sizeof in_query) < 0) {
         fprintf(stderr, "Bad input URI: %s\n", input_uri);
         return 1;
     }

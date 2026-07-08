@@ -67,6 +67,12 @@ Smoke test it locally:
 bash scripts/smoke-test.sh
 ```
 
+Format C sources:
+
+```bash
+bash scripts/format.sh
+```
+
 ## GitHub Releases
 
 Build the release asset:
@@ -104,6 +110,7 @@ gh release upload "$(cat VERSION)" build/srt-bonding-relay-linux-x86_64.tar.gz -
 This repo includes a GitHub Actions workflow that:
 
 - builds the relay with Docker
+- checks C formatting with `clang-format`
 - checks the usage path
 - starts the relay with `srt-bonding-relay.json`
 - verifies the local HTTP status endpoint responds

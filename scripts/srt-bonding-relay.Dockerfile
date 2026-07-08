@@ -25,8 +25,8 @@ RUN ./configure --prefix=/usr/local --enable-apps=OFF --enable-bonding \
 WORKDIR /src/app
 ARG RELAY_SOURCE_SHA=dev
 RUN printf '%s\n' "$RELAY_SOURCE_SHA" > /tmp/relay-source.sha
-COPY src/srt-bonding-relay.c .
-RUN g++ -O2 -DRELAY_VERSION=\"${RELAY_VERSION}\" -o srt-bonding-relay srt-bonding-relay.c \
+COPY src/ ./src/
+RUN g++ -O2 -DRELAY_VERSION=\"${RELAY_VERSION}\" -o srt-bonding-relay src/*.c \
     $(pkg-config --cflags --libs srt) -lpthread -lssl -lcrypto -lm
 
 RUN set -eux; \
