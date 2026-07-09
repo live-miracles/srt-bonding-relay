@@ -2,7 +2,7 @@
 
 Standalone SRT bonding ingress relay. It accepts bonded/redundant SRT groups
 on one listener socket and forwards the deduplicated MPEG-TS payload to a
-downstream SRT or UDP target.
+downstream SRT target.
 
 ## Data path
 
@@ -27,8 +27,6 @@ downstream SRT or UDP target.
    +-----------------------------+
               |
               +----> srt:// output, same streamid
-              |
-              +----> udp:// output, raw MPEG-TS datagrams
 ```
 
 ## Design
@@ -55,12 +53,9 @@ downstream SRT or UDP target.
   new connection is rejected as a duplicate.
 - **Forwarding.** Each session thread reads deduplicated payload off the
   group socket with `srt_recvmsg2` and writes it downstream with
-  `srt_sendmsg2` for an `srt://` output URI, or `sendto` for a `udp://`
-  output URI. UDP output is just raw MPEG-TS datagrams to the configured
-  host/port; it has no SRT streamid, encryption, retry, or connection state.
-  If the downstream SRT target is unreachable, the session retries with backoff
-  (1s, 2s, 4s, 8s, 16s) in the background without dropping the encoder's
-  input connection.
+  `srt_sendmsg2` over the `srt://` output connection. If the downstream SRT
+  target is unreachable, the session retries with backoff (1s, 2s, 4s, 8s,
+  16s) in the background without dropping the encoder's input connection.
 - **Stats collection.** A per-session sampler (`update_stream_srt_counters`,
   rate-limited to once/sec/session) pulls counters from libsrt
   (`srt_bstats`, `srt_group_data`) under a lock and writes them into the
@@ -82,7 +77,7 @@ downstream SRT or UDP target.
 The relay accepts either:
 
 - `srt-bonding-relay <config.json>`
-- `srt-bonding-relay <input-uri> <output-uri>`
+- `srt-bonding-relay <srt-input-uri> <srt-output-uri>`
 
 Minimal JSON config:
 
@@ -104,13 +99,11 @@ Fields:
 - `output_host`: downstream SRT publish host
 - `output_port`: downstream SRT publish port
 - `status_port`: local HTTP status endpoint port
-- `passphrase`: SRT passphrase applied to the input and to `srt://` output.
-  Use `""` to disable encryption. It does not apply to `udp://` output.
+- `passphrase`: SRT passphrase applied to the input and to the `srt://` output.
+  Use `""` to disable encryption.
 
 The relay is streamid-agnostic. It accepts any incoming `streamid` and copies it
-to the downstream SRT publish socket automatically. For `udp://` output, the
-streamid is only used inside the relay for session tracking; UDP itself does
-not carry it.
+to the downstream SRT publish socket automatically.
 
 All config fields are required.
 

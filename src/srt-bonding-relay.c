@@ -5,13 +5,13 @@
  *
  * Listens on one encoder-facing SRT port with SRTO_GROUPCONNECT enabled,
  * accepts bonded/redundant SRT groups, and forwards the deduplicated MPEG-TS
- * payload into a downstream SRT or UDP output. The incoming caller streamid is
+ * payload into a downstream SRT output. The incoming caller streamid is
  * copied to the outgoing SRT connection, so a single listener can serve many
  * logical streams.
  *
  * Usage:
  *   srt-bonding-relay <config.json>
- *   srt-bonding-relay <srt-input-uri> <output-uri>
+ *   srt-bonding-relay <srt-input-uri> <srt-output-uri>
  *
  * Example JSON:
  *   {
@@ -323,7 +323,6 @@ static void wait_for_session_threads(void) {
 }
 
 typedef struct relay_config {
-    int udp_out;
     char out_query[1024];
     struct sockaddr_storage out_addr;
     socklen_t out_addrlen;
@@ -960,7 +959,6 @@ static void *session_main(void *arg) {
 
     fprintf(stderr, "Accepted bonded SRT source streamid=%s\n", streamid[0] ? streamid : "(empty)");
     int state_slot = claim_stream_state(streamid, tracker_slot);
-    int udp_fd = -1;
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
 
@@ -1005,23 +1003,12 @@ static void *session_main(void *arg) {
         goto cleanup;
     }
 
-    if (cfg->udp_out) {
-        udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_fd < 0) {
-            set_last_errorf("socket(UDP): %s", strerror(errno));
-            set_stream_errorf(state_slot, "socket(UDP): %s", strerror(errno));
-            perror("socket(UDP)");
-            remove_stream_state(state_slot);
-            goto cleanup;
-        }
-    } else {
-        srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
-                                                &next_output_retry_at_ms);
-    }
+    srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                            &next_output_retry_at_ms);
 
     char buf[CHUNK];
     while (g_running && stream_input_still_connected(conn)) {
-        if (!cfg->udp_out && srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
+        if (srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
             srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
                                                     &next_output_retry_at_ms);
         }
@@ -1041,9 +1028,7 @@ static void *session_main(void *arg) {
         record_stream_input_progress(state_slot);
         update_stream_srt_counters(state_slot, tracker_slot, conn, srt_out, 0);
 
-        if (udp_fd >= 0) {
-            sendto(udp_fd, buf, (size_t)r, 0, (struct sockaddr *)&cfg->out_addr, cfg->out_addrlen);
-        } else if (srt_out != SRT_INVALID_SOCK) {
+        if (srt_out != SRT_INVALID_SOCK) {
             if (srt_sendmsg2(srt_out, buf, r, NULL) == SRT_ERROR) {
                 set_last_errorf("srt_sendmsg2: %s", srt_getlasterror_str());
                 set_stream_errorf(state_slot, "Relay output error: %s", srt_getlasterror_str());
@@ -1060,7 +1045,6 @@ static void *session_main(void *arg) {
         }
     }
 
-    if (udp_fd >= 0) close(udp_fd);
     update_stream_srt_counters(state_slot, tracker_slot, conn, srt_out, 1);
     if (srt_out != SRT_INVALID_SOCK &&
         take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
@@ -1136,7 +1120,7 @@ int main(int argc, char *argv[]) {
         fprintf(stderr,
                 "Usage: %s [--version]\n"
                 "   or: %s <config.json>\n"
-                "   or: %s <srt-input-uri> <output-uri>\n",
+                "   or: %s <srt-input-uri> <srt-output-uri>\n",
                 argv[0], argv[0], argv[0]);
         return 1;
     }
@@ -1184,14 +1168,13 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Input URI must use srt://\n");
         return 1;
     }
+    if (strcmp(out_scheme, "srt") != 0) {
+        fprintf(stderr, "Output URI must use srt://\n");
+        return 1;
+    }
 
     relay_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
-    cfg.udp_out = strcmp(out_scheme, "udp") == 0;
-    if (!cfg.udp_out && strcmp(out_scheme, "srt") != 0) {
-        fprintf(stderr, "Output URI must use srt:// or udp://\n");
-        return 1;
-    }
     strncpy(cfg.out_query, out_query, sizeof cfg.out_query - 1);
 
     if (resolve_output(out_host, out_port, &cfg) < 0) return 1;
