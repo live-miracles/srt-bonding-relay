@@ -59,6 +59,20 @@
 static const char *RELAY_VERSION_STRING = RELAY_VERSION;
 static const int RETRY_DELAYS_MS[] = {1000, 2000, 4000, 8000, 16000};
 
+typedef struct relay_leg_state {
+    char ip[INET6_ADDRSTRLEN];
+    int port;
+    int member_state;
+    int stats_valid;
+    long long recv_packets_total;
+    long long recv_unique_packets_total;
+    int recv_loss_total;
+    int recv_drop_total;
+    int retrans_total;
+    double rtt_ms;
+    int rtt_valid;
+} relay_leg_state_t;
+
 typedef struct relay_stream_state {
     char streamid[1024];
     int input_active;
@@ -74,13 +88,16 @@ typedef struct relay_stream_state {
     int recv_loss_total;
     int recv_drop_total;
     int retrans_total;
-    double rtt_ms;
-    int rtt_valid;
     double input_rtt_ms;
     int input_rtt_valid;
     double output_rtt_ms;
     int output_rtt_valid;
-    int group_member_count;
+    long long output_sent_packets_total;
+    int output_send_loss_total;
+    int output_send_drop_total;
+    int output_retrans_total;
+    relay_leg_state_t legs[MAX_GROUP_MEMBERS];
+    int leg_count;
     long long last_stats_at_ms;
     char last_error[LAST_ERROR_MAX];
     long long last_error_at_ms;
@@ -377,6 +394,36 @@ static long long max_ll(long long a, long long b) {
     return a > b ? a : b;
 }
 
+static void format_leg_addr(const struct sockaddr_storage *ss, char *ip_out, size_t ip_out_len,
+                            int *port_out) {
+    ip_out[0] = '\0';
+    *port_out = 0;
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+        inet_ntop(AF_INET, &sin->sin_addr, ip_out, ip_out_len);
+        *port_out = ntohs(sin->sin_port);
+    } else if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ip_out, ip_out_len);
+        *port_out = ntohs(sin6->sin6_port);
+    }
+}
+
+static const char *member_state_str(int member_state) {
+    switch (member_state) {
+    case SRT_GST_PENDING:
+        return "pending";
+    case SRT_GST_IDLE:
+        return "idle";
+    case SRT_GST_RUNNING:
+        return "running";
+    case SRT_GST_BROKEN:
+        return "broken";
+    default:
+        return "unknown";
+    }
+}
+
 static int max_int(int a, int b) {
     return a > b ? a : b;
 }
@@ -505,12 +552,12 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     int have_in = 0;
 
     int is_group_sock = in_sock != SRT_INVALID_SOCK && (in_sock & SRTGROUP_MASK);
-    int group_member_count = 0;
-    int have_group_member_stats = 0;
-    double group_member_rtt_ms = 0.0;
     int have_out = 0;
     SRT_TRACEBSTATS out_stats;
     memset(&out_stats, 0, sizeof out_stats);
+    relay_leg_state_t legs[MAX_GROUP_MEMBERS];
+    int leg_count = 0;
+    memset(legs, 0, sizeof legs);
 
     pthread_mutex_lock(&g_session_threads_mu);
     int tracker_valid = tracker_slot >= 0 && tracker_slot < MAX_ACTIVE_SESSIONS;
@@ -532,16 +579,26 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                 for (size_t i = 0; i < member_count; ++i) {
                     if (members[i].id == SRT_INVALID_SOCK) continue;
                     if (members[i].memberstate == SRT_GST_BROKEN) continue;
-                    group_member_count++;
 
                     SRT_TRACEBSTATS member_stats;
                     memset(&member_stats, 0, sizeof member_stats);
-                    if (srt_bstats(members[i].id, &member_stats, 0) == SRT_ERROR) continue;
-                    if (member_stats.msRTT <= 0.0) continue;
+                    int have_member_stats =
+                        srt_bstats(members[i].id, &member_stats, 0) != SRT_ERROR;
 
-                    have_group_member_stats = 1;
-                    if (member_stats.msRTT > group_member_rtt_ms) {
-                        group_member_rtt_ms = member_stats.msRTT;
+                    if (leg_count < MAX_GROUP_MEMBERS) {
+                        relay_leg_state_t *leg = &legs[leg_count++];
+                        format_leg_addr(&members[i].peeraddr, leg->ip, sizeof leg->ip, &leg->port);
+                        leg->member_state = members[i].memberstate;
+                        leg->stats_valid = have_member_stats;
+                        if (have_member_stats) {
+                            leg->rtt_ms = member_stats.msRTT;
+                            leg->rtt_valid = member_stats.msRTT > 0.0;
+                            leg->recv_packets_total = member_stats.pktRecvTotal;
+                            leg->recv_unique_packets_total = member_stats.pktRecvUniqueTotal;
+                            leg->recv_loss_total = member_stats.pktRcvLossTotal;
+                            leg->recv_drop_total = member_stats.pktRcvDropTotal;
+                            leg->retrans_total = member_stats.pktRcvRetrans;
+                        }
                     }
                 }
             }
@@ -573,19 +630,14 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     if (have_out) {
         g_sessions[slot].state.output_rtt_ms = out_stats.msRTT;
         g_sessions[slot].state.output_rtt_valid = out_stats.msRTT > 0.0;
+        g_sessions[slot].state.output_sent_packets_total = out_stats.pktSentTotal;
+        g_sessions[slot].state.output_send_loss_total = out_stats.pktSndLossTotal;
+        g_sessions[slot].state.output_send_drop_total = out_stats.pktSndDropTotal;
+        g_sessions[slot].state.output_retrans_total = out_stats.pktRetransTotal;
     }
-    g_sessions[slot].state.group_member_count = group_member_count;
-    if (have_group_member_stats) {
-        g_sessions[slot].state.rtt_ms = group_member_rtt_ms;
-        g_sessions[slot].state.rtt_valid = 1;
-    } else if (is_group_sock) {
-        g_sessions[slot].state.rtt_valid = 0;
-    } else if (have_in) {
-        g_sessions[slot].state.rtt_ms = in_stats.msRTT;
-        g_sessions[slot].state.rtt_valid = in_stats.msRTT > 0.0;
-    } else if (have_out) {
-        g_sessions[slot].state.rtt_ms = out_stats.msRTT;
-        g_sessions[slot].state.rtt_valid = out_stats.msRTT > 0.0;
+    g_sessions[slot].state.leg_count = leg_count;
+    for (int li = 0; li < leg_count; ++li) {
+        g_sessions[slot].state.legs[li] = legs[li];
     }
     g_sessions[slot].state.last_stats_at_ms = now;
     pthread_mutex_unlock(&g_sessions_mu);
@@ -668,15 +720,9 @@ static void write_status_response(int client_fd) {
         }
         fprintf(f,
                 ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      "
-                "\"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"rttMs\": ",
+                "\"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"inputRttMs\": ",
                 states[i].recv_unique_packets_total, states[i].recv_loss_total,
                 states[i].recv_drop_total, states[i].retrans_total);
-        if (states[i].rtt_valid) {
-            fprintf(f, "%.3f", states[i].rtt_ms);
-        } else {
-            fputs("null", f);
-        }
-        fputs(",\n      \"inputRttMs\": ", f);
         if (states[i].input_rtt_valid) {
             fprintf(f, "%.3f", states[i].input_rtt_ms);
         } else {
@@ -689,9 +735,44 @@ static void write_status_response(int client_fd) {
             fputs("null", f);
         }
         fprintf(f,
-                ",\n      \"groupMemberCount\": %d,\n      \"lastErrorAt\": %lld,\n      "
-                "\"lastError\": ",
-                states[i].group_member_count, states[i].last_error_at_ms);
+                ",\n      \"outputSentPacketsTotal\": %lld,\n      \"outputSendLossTotal\": %d,\n"
+                "      \"outputSendDropTotal\": %d,\n      \"outputRetransTotal\": %d,\n      "
+                "\"legs\": [",
+                states[i].output_sent_packets_total, states[i].output_send_loss_total,
+                states[i].output_send_drop_total, states[i].output_retrans_total);
+
+        int leg_first = 1;
+        for (int j = 0; j < states[i].leg_count; ++j) {
+            const relay_leg_state_t *leg = &states[i].legs[j];
+            fprintf(f, "%s\n        {\n          \"ip\": \"", leg_first ? "\n" : ",\n");
+            json_write_escaped(f, leg->ip);
+            fprintf(f,
+                    "\",\n          \"port\": %d,\n          \"state\": \"%s\",\n          "
+                    "\"rttMs\": ",
+                    leg->port, member_state_str(leg->member_state));
+            if (leg->rtt_valid) {
+                fprintf(f, "%.3f", leg->rtt_ms);
+            } else {
+                fputs("null", f);
+            }
+            fputs(",\n          \"recvPacketsTotal\": ", f);
+            if (leg->stats_valid) {
+                fprintf(f,
+                        "%lld,\n          \"recvUniquePacketsTotal\": %lld,\n          "
+                        "\"recvLossTotal\": %d,\n          \"recvDropTotal\": %d,\n          "
+                        "\"retransTotal\": %d\n        }",
+                        leg->recv_packets_total, leg->recv_unique_packets_total,
+                        leg->recv_loss_total, leg->recv_drop_total, leg->retrans_total);
+            } else {
+                fputs("null,\n          \"recvUniquePacketsTotal\": null,\n          "
+                      "\"recvLossTotal\": null,\n          \"recvDropTotal\": null,\n          "
+                      "\"retransTotal\": null\n        }",
+                      f);
+            }
+            leg_first = 0;
+        }
+        fprintf(f, "%s\n      ],\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
+                leg_first ? "" : "\n", states[i].last_error_at_ms);
         if (states[i].last_error[0]) {
             fputc('"', f);
             json_write_escaped(f, states[i].last_error);
@@ -1139,6 +1220,20 @@ int main(int argc, char *argv[]) {
 
     apply_srt_opts(srv, in_query);
 
+    char in_passphrase[512];
+    int in_has_passphrase =
+        get_param(in_query, "passphrase", in_passphrase, sizeof in_passphrase) && in_passphrase[0];
+    if (in_has_passphrase) {
+        /* SRTO_ENFORCEDENCRYPTION defaults to on, which makes SRT reject a
+         * bad-passphrase handshake internally before srt_accept() ever sees
+         * it - so the relay can't log the offending peer for fail2ban.
+         * Disabling it lets the connection complete; SRTO_KMSTATE is then
+         * checked explicitly right after accept, below, to require a secured
+         * key exchange before a session is started. */
+        int enforced = 0;
+        srt_setsockflag(srv, SRTO_ENFORCEDENCRYPTION, &enforced, sizeof enforced);
+    }
+
     struct sockaddr_in sa;
     if (resolve_input_bind_addr(in_host, in_port, &sa) < 0) {
         srt_close(srv);
@@ -1208,6 +1303,23 @@ int main(int argc, char *argv[]) {
                 set_last_errorf("srt_accept: %s", srt_getlasterror_str());
                 fprintf(stderr, "srt_accept: %s\n", srt_getlasterror_str());
                 continue;
+            }
+
+            if (in_has_passphrase) {
+                SRT_KM_STATE kmstate = SRT_KM_S_UNSECURED;
+                int kmlen = (int)sizeof kmstate;
+                if (srt_getsockflag(conn, SRTO_KMSTATE, &kmstate, &kmlen) == SRT_ERROR ||
+                    kmstate != SRT_KM_S_SECURED) {
+                    char peer_ip[INET6_ADDRSTRLEN] = "?";
+                    int peer_port = 0;
+                    format_leg_addr(&peer, peer_ip, sizeof peer_ip, &peer_port);
+                    set_last_errorf("Rejected connection (bad passphrase) from %s:%d", peer_ip,
+                                    peer_port);
+                    fprintf(stderr, "Rejected connection (bad passphrase) from %s:%d\n", peer_ip,
+                            peer_port);
+                    srt_close(conn);
+                    continue;
+                }
             }
 
             session_args_t *args = (session_args_t *)calloc(1, sizeof *args);
