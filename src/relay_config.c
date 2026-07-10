@@ -236,5 +236,15 @@ int load_config_file(const char *path, file_config_t *cfg) {
     if (cfg->input_port <= 0 || cfg->input_port > 65535) return -1;
     if (cfg->output_port <= 0 || cfg->output_port > 65535) return -1;
     if (cfg->status_port <= 0 || cfg->status_port > 65535) return -1;
+    /* SRT only accepts passphrases of 10..79 characters. Reject anything
+     * else at startup: srt_setsockflag(SRTO_PASSPHRASE) would fail at
+     * runtime, leaving the listener rejecting every connection and the
+     * output publishing unencrypted. */
+    size_t pass_len = strlen(cfg->passphrase);
+    if (pass_len > 0 && (pass_len < 10 || pass_len > 79)) {
+        fprintf(stderr, "Config passphrase must be empty or 10..79 characters, got %zu\n",
+                pass_len);
+        return -1;
+    }
     return 0;
 }
