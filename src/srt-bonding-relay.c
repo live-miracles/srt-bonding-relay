@@ -114,12 +114,24 @@ typedef struct active_session {
 typedef struct relay_session_slot {
     relay_stream_state_t state;
     active_session_t active;
+    pthread_mutex_t state_mu;
 } relay_session_slot_t;
 
+/* Locking rules for g_sessions[i].state:
+ *  - g_sessions_mu guards slot ownership: state.streamid is only written
+ *    (claimed or cleared) while holding BOTH g_sessions_mu and the slot's
+ *    state_mu, so it may be read under either lock alone.
+ *  - Every other state field is guarded by the slot's state_mu only, so
+ *    per-packet bookkeeping from one session never contends with other
+ *    sessions on a process-wide lock.
+ *  - g_last_error is guarded by its own g_last_error_mu.
+ *  - Lock order where nested: g_sessions_mu -> state_mu.
+ * The active (socket tracking) fields stay under g_session_threads_mu. */
 static volatile sig_atomic_t g_running = 1;
 static pthread_mutex_t g_sessions_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_session_threads_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_session_threads_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t g_last_error_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_last_error[512];
 static relay_session_slot_t g_sessions[MAX_ACTIVE_SESSIONS];
 static int g_active_session_threads = 0;
@@ -155,6 +167,7 @@ static void init_session_tracking(void) {
         memset(&g_sessions[i].active, 0, sizeof g_sessions[i].active);
         g_sessions[i].active.input_sock = SRT_INVALID_SOCK;
         g_sessions[i].active.output_sock = SRT_INVALID_SOCK;
+        pthread_mutex_init(&g_sessions[i].state_mu, NULL);
     }
     g_active_session_threads = 0;
     pthread_mutex_unlock(&g_session_threads_mu);
@@ -381,23 +394,23 @@ static void json_write_escaped(FILE *f, const char *s) {
 }
 
 static void set_last_errorf(const char *fmt, ...) {
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_last_error_mu);
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_last_error, sizeof g_last_error, fmt, ap);
     va_end(ap);
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_last_error_mu);
 }
 
 static void set_stream_errorf(int slot, const char *fmt, ...) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_sessions[slot].state.last_error, sizeof g_sessions[slot].state.last_error, fmt, ap);
     va_end(ap);
     g_sessions[slot].state.last_error_at_ms = now_ms();
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static long long max_ll(long long a, long long b) {
@@ -455,6 +468,7 @@ static int claim_stream_state(const char *streamid, int preferred_slot) {
             slot = preferred_slot;
         }
         if (slot >= 0) {
+            pthread_mutex_lock(&g_sessions[slot].state_mu);
             memset(&g_sessions[slot].state, 0, sizeof g_sessions[slot].state);
             strncpy(g_sessions[slot].state.streamid, streamid,
                     sizeof g_sessions[slot].state.streamid - 1);
@@ -462,6 +476,7 @@ static int claim_stream_state(const char *streamid, int preferred_slot) {
             g_sessions[slot].state.input_active = 1;
             g_sessions[slot].state.last_input_packet_at_ms = now_ms();
             g_sessions[slot].state.last_input_packet_mono_ms = now_mono_ms();
+            pthread_mutex_unlock(&g_sessions[slot].state_mu);
         }
     }
     pthread_mutex_unlock(&g_sessions_mu);
@@ -479,7 +494,9 @@ static int stream_input_age_ms(const char *streamid, long long now, long long *a
         if (!g_sessions[i].state.streamid[0]) continue;
         if (strcmp(g_sessions[i].state.streamid, streamid) != 0) continue;
         found = 1;
+        pthread_mutex_lock(&g_sessions[i].state_mu);
         last_input_at = g_sessions[i].state.last_input_packet_mono_ms;
+        pthread_mutex_unlock(&g_sessions[i].state_mu);
         break;
     }
     pthread_mutex_unlock(&g_sessions_mu);
@@ -493,34 +510,36 @@ static int stream_input_age_ms(const char *streamid, long long now, long long *a
 static void remove_stream_state(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     memset(&g_sessions[slot].state, 0, sizeof g_sessions[slot].state);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
 static void set_stream_output_connected(int slot, int connected) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     g_sessions[slot].state.output_connected = connected;
     if (connected) {
         g_sessions[slot].state.retry_failures = 0;
         g_sessions[slot].state.last_error[0] = '\0';
         g_sessions[slot].state.last_error_at_ms = 0;
     }
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static void increment_stream_retry_failures(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     g_sessions[slot].state.retry_failures++;
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static int get_stream_retry_failures(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return 0;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     int failures = g_sessions[slot].state.retry_failures;
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
     return failures;
 }
 
@@ -534,19 +553,19 @@ static int get_retry_delay_ms(int failures) {
 
 static void record_stream_input_progress(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     g_sessions[slot].state.last_input_packet_at_ms = now_ms();
     g_sessions[slot].state.last_input_packet_mono_ms = now_mono_ms();
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static void record_stream_forward_progress(int slot, int bytes) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS || bytes <= 0) return;
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     g_sessions[slot].state.forwarded_packets++;
     g_sessions[slot].state.forwarded_bytes += bytes;
     g_sessions[slot].state.last_packet_at_ms = now_ms();
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_sock,
@@ -554,9 +573,9 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
     long long now = now_mono_ms();
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     long long last = g_sessions[slot].state.last_stats_at_ms;
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
     if (!force && last > 0 && now - last < 1000) return;
 
     SRT_TRACEBSTATS in_stats;
@@ -622,7 +641,7 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     }
     pthread_mutex_unlock(&g_session_threads_mu);
 
-    pthread_mutex_lock(&g_sessions_mu);
+    pthread_mutex_lock(&g_sessions[slot].state_mu);
     if (have_in) {
         g_sessions[slot].state.input_rtt_ms = in_stats.msRTT;
         g_sessions[slot].state.input_rtt_valid = in_stats.msRTT > 0.0;
@@ -652,7 +671,7 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
         g_sessions[slot].state.legs[li] = legs[li];
     }
     g_sessions[slot].state.last_stats_at_ms = now;
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_sessions[slot].state_mu);
 }
 
 static int stream_input_still_connected(SRTSOCKET conn) {
@@ -665,12 +684,18 @@ static void write_status_response(int client_fd) {
     char last_error[sizeof g_last_error];
     long long updated_at_ms = now_ms();
 
-    pthread_mutex_lock(&g_sessions_mu);
+    /* Copy each slot under its own lock: the snapshot is consistent per
+     * stream (which is all the status API promises), and the copy loop no
+     * longer stalls every session's per-packet bookkeeping behind one
+     * process-wide lock. */
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
+        pthread_mutex_lock(&g_sessions[i].state_mu);
         states[i] = g_sessions[i].state;
+        pthread_mutex_unlock(&g_sessions[i].state_mu);
     }
+    pthread_mutex_lock(&g_last_error_mu);
     memcpy(last_error, g_last_error, sizeof last_error);
-    pthread_mutex_unlock(&g_sessions_mu);
+    pthread_mutex_unlock(&g_last_error_mu);
 
     int out_fd = dup(client_fd);
     if (out_fd < 0) return;
