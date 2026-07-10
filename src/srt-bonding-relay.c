@@ -598,7 +598,18 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     int can_read_out = tracker_valid && out_sock != SRT_INVALID_SOCK &&
                        g_sessions[tracker_slot].active.in_use &&
                        g_sessions[tracker_slot].active.output_sock == out_sock;
+    pthread_mutex_unlock(&g_session_threads_mu);
 
+    /* The stats calls below run outside g_session_threads_mu: holding it
+     * across up to 1 + MAX_GROUP_MEMBERS srt_bstats() calls per session per
+     * second serialized every session against the accept path
+     * (register_session_thread) and all socket-handoff operations. The
+     * tradeoff is a benign race: a concurrent takeover/shutdown may
+     * srt_close() one of these sockets after the ownership check above, in
+     * which case libsrt fails the call on the stale id (socket ids are not
+     * reused) and the sample is skipped - same handling as any other stats
+     * failure. The sockets are never closed by this session's own thread
+     * while it is in this function. */
     if (can_read_in) {
         have_in = srt_bstats(in_sock, &in_stats, 0) != SRT_ERROR;
 
@@ -639,7 +650,6 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     if (can_read_out) {
         have_out = srt_bstats(out_sock, &out_stats, 0) != SRT_ERROR;
     }
-    pthread_mutex_unlock(&g_session_threads_mu);
 
     pthread_mutex_lock(&g_sessions[slot].state_mu);
     if (have_in) {
