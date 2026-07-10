@@ -79,6 +79,7 @@ typedef struct relay_stream_state {
     int output_connected;
     int retry_failures;
     long long last_input_packet_at_ms;
+    long long last_input_packet_mono_ms;
     long long forwarded_packets;
     long long forwarded_bytes;
     long long last_packet_at_ms;
@@ -334,9 +335,19 @@ typedef struct session_args {
     int tracker_slot;
 } session_args_t;
 
+/* Wall clock; used only for timestamps exposed via the status API. */
 static long long now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
+    return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
+}
+
+/* Monotonic clock for internal timers (retry backoff, duplicate-takeover
+ * staleness, stats throttling), which must not fire early or stall when
+ * NTP steps the wall clock. */
+static long long now_mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
@@ -450,6 +461,7 @@ static int claim_stream_state(const char *streamid, int preferred_slot) {
             g_sessions[slot].state.streamid[sizeof g_sessions[slot].state.streamid - 1] = '\0';
             g_sessions[slot].state.input_active = 1;
             g_sessions[slot].state.last_input_packet_at_ms = now_ms();
+            g_sessions[slot].state.last_input_packet_mono_ms = now_mono_ms();
         }
     }
     pthread_mutex_unlock(&g_sessions_mu);
@@ -467,7 +479,7 @@ static int stream_input_age_ms(const char *streamid, long long now, long long *a
         if (!g_sessions[i].state.streamid[0]) continue;
         if (strcmp(g_sessions[i].state.streamid, streamid) != 0) continue;
         found = 1;
-        last_input_at = g_sessions[i].state.last_input_packet_at_ms;
+        last_input_at = g_sessions[i].state.last_input_packet_mono_ms;
         break;
     }
     pthread_mutex_unlock(&g_sessions_mu);
@@ -524,6 +536,7 @@ static void record_stream_input_progress(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.last_input_packet_at_ms = now_ms();
+    g_sessions[slot].state.last_input_packet_mono_ms = now_mono_ms();
     pthread_mutex_unlock(&g_sessions_mu);
 }
 
@@ -540,7 +553,7 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                                        SRTSOCKET out_sock, int force) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
 
-    long long now = now_ms();
+    long long now = now_mono_ms();
     pthread_mutex_lock(&g_sessions_mu);
     long long last = g_sessions[slot].state.last_stats_at_ms;
     pthread_mutex_unlock(&g_sessions_mu);
@@ -832,6 +845,16 @@ static void *status_http_main(void *arg) {
         int client = accept(srv, NULL, NULL);
         if (client < 0) continue;
 
+        /* Bound status I/O so a client that connects but never sends a
+         * request (or stops reading the response) cannot block this thread
+         * forever - that would kill the status endpoint and hang the
+         * pthread_join() on shutdown. */
+        struct timeval io_timeout;
+        io_timeout.tv_sec = 2;
+        io_timeout.tv_usec = 0;
+        setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof io_timeout);
+        setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &io_timeout, sizeof io_timeout);
+
         char req[1024];
         ssize_t req_len = recv(client, req, sizeof req, 0);
         if (req_len <= 0) {
@@ -846,32 +869,64 @@ static void *status_http_main(void *arg) {
     return NULL;
 }
 
-static void apply_srt_opts(SRTSOCKET sock, const char *query) {
+/* Sets one SRT socket option and logs on failure. The option value is
+ * intentionally not logged: it may be a passphrase. */
+static int set_srt_flag_checked(SRTSOCKET sock, SRT_SOCKOPT opt, const char *name, const void *val,
+                                int len) {
+    if (srt_setsockflag(sock, opt, val, len) == SRT_ERROR) {
+        set_last_errorf("srt_setsockflag(%s): %s", name, srt_getlasterror_str());
+        fprintf(stderr, "srt_setsockflag(%s): %s\n", name, srt_getlasterror_str());
+        return -1;
+    }
+    return 0;
+}
+
+/* Returns 0 only if every option present in the query was applied. A
+ * silently ignored failure here is dangerous: a rejected SRTO_PASSPHRASE
+ * would leave the socket running unencrypted. */
+static int apply_srt_opts(SRTSOCKET sock, const char *query) {
     char val[512];
+    int rc = 0;
 
     if (get_param(query, "transtype", val, sizeof val)) {
         SRT_TRANSTYPE tt = strcmp(val, "live") == 0 ? SRTT_LIVE : SRTT_FILE;
-        srt_setsockflag(sock, SRTO_TRANSTYPE, &tt, sizeof tt);
+        rc |= set_srt_flag_checked(sock, SRTO_TRANSTYPE, "transtype", &tt, sizeof tt);
     }
     if (get_param(query, "groupconnect", val, sizeof val)) {
         int v = atoi(val);
-        srt_setsockflag(sock, SRTO_GROUPCONNECT, &v, sizeof v);
+        rc |= set_srt_flag_checked(sock, SRTO_GROUPCONNECT, "groupconnect", &v, sizeof v);
     }
     if (get_param(query, "latency", val, sizeof val)) {
         int v = atoi(val);
-        srt_setsockflag(sock, SRTO_LATENCY, &v, sizeof v);
+        rc |= set_srt_flag_checked(sock, SRTO_LATENCY, "latency", &v, sizeof v);
     }
     if (get_param(query, "rcvlatency", val, sizeof val)) {
         int v = atoi(val);
-        srt_setsockflag(sock, SRTO_RCVLATENCY, &v, sizeof v);
+        rc |= set_srt_flag_checked(sock, SRTO_RCVLATENCY, "rcvlatency", &v, sizeof v);
     }
     if (get_param(query, "passphrase", val, sizeof val)) {
-        srt_setsockflag(sock, SRTO_PASSPHRASE, val, (int)strlen(val));
+        rc |= set_srt_flag_checked(sock, SRTO_PASSPHRASE, "passphrase", val, (int)strlen(val));
     }
     if (get_param(query, "pbkeylen", val, sizeof val)) {
         int v = atoi(val);
-        srt_setsockflag(sock, SRTO_PBKEYLEN, &v, sizeof v);
+        rc |= set_srt_flag_checked(sock, SRTO_PBKEYLEN, "pbkeylen", &v, sizeof v);
     }
+    return rc;
+}
+
+/* SRT only accepts passphrases of 10..79 characters; anything else makes
+ * srt_setsockflag(SRTO_PASSPHRASE) fail. Validate up front so a bad value
+ * is a startup error instead of a mysteriously rejected (input) or
+ * silently unencrypted (output) connection. */
+static int query_passphrase_ok(const char *query, const char *which) {
+    char val[512];
+    if (!get_param(query, "passphrase", val, sizeof val) || !val[0]) return 1;
+    size_t len = strlen(val);
+    if (len < 10 || len > 79) {
+        fprintf(stderr, "%s passphrase must be 10..79 characters, got %zu\n", which, len);
+        return 0;
+    }
+    return 1;
 }
 
 static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz) {
@@ -896,15 +951,27 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
     set_tracked_session_output_socket(tracker_slot, srt_out);
 
     SRT_TRANSTYPE tt = SRTT_LIVE;
-    srt_setsockflag(srt_out, SRTO_TRANSTYPE, &tt, sizeof tt);
-    apply_srt_opts(srt_out, cfg->out_query);
+    int opt_rc = set_srt_flag_checked(srt_out, SRTO_TRANSTYPE, "transtype", &tt, sizeof tt);
+    opt_rc |= apply_srt_opts(srt_out, cfg->out_query);
 
     if (streamid && streamid[0]) {
-        srt_setsockflag(srt_out, SRTO_STREAMID, streamid, (int)strlen(streamid));
+        opt_rc |= set_srt_flag_checked(srt_out, SRTO_STREAMID, "streamid", streamid,
+                                       (int)strlen(streamid));
     }
 
     int cto = 3000;
-    srt_setsockflag(srt_out, SRTO_CONNTIMEO, &cto, sizeof cto);
+    opt_rc |= set_srt_flag_checked(srt_out, SRTO_CONNTIMEO, "conntimeo", &cto, sizeof cto);
+
+    /* Never connect with a partially applied option set: if the passphrase
+     * (or any other option) was rejected, the connection could go out
+     * unencrypted or misrouted. Treat it as a failed attempt and let the
+     * caller's retry/backoff handle it. */
+    if (opt_rc != 0) {
+        if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
+            srt_close(srt_out);
+        }
+        return SRT_INVALID_SOCK;
+    }
 
     if (srt_connect(srt_out, (struct sockaddr *)&cfg->out_addr, (int)cfg->out_addrlen) ==
         SRT_ERROR) {
@@ -938,7 +1005,7 @@ static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const 
     set_stream_output_connected(state_slot, 0);
     set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
                       delay_ms);
-    if (next_retry_at_ms) *next_retry_at_ms = now_ms() + delay_ms;
+    if (next_retry_at_ms) *next_retry_at_ms = now_mono_ms() + delay_ms;
     return SRT_INVALID_SOCK;
 }
 
@@ -963,10 +1030,10 @@ static void *session_main(void *arg) {
     long long next_output_retry_at_ms = 0;
 
     if (state_slot == -2) {
-        long long deadline = now_ms() + DUPLICATE_TAKEOVER_WAIT_MS;
+        long long deadline = now_mono_ms() + DUPLICATE_TAKEOVER_WAIT_MS;
         int takeover_started = 0;
         do {
-            long long now = now_ms();
+            long long now = now_mono_ms();
             long long input_age_ms = 0;
             int stream_present = stream_input_age_ms(streamid, now, &input_age_ms) == 0;
 
@@ -989,7 +1056,7 @@ static void *session_main(void *arg) {
             ts.tv_sec = 0;
             ts.tv_nsec = 50 * 1000 * 1000;
             nanosleep(&ts, NULL);
-        } while (g_running && state_slot == -2 && now_ms() < deadline);
+        } while (g_running && state_slot == -2 && now_mono_ms() < deadline);
 
         if (state_slot == -2) {
             set_last_errorf("Duplicate publisher rejected for active streamid=%s", streamid);
@@ -1008,7 +1075,7 @@ static void *session_main(void *arg) {
 
     char buf[CHUNK];
     while (g_running && stream_input_still_connected(conn)) {
-        if (srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
+        if (srt_out == SRT_INVALID_SOCK && now_mono_ms() >= next_output_retry_at_ms) {
             srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
                                                     &next_output_retry_at_ms);
         }
@@ -1038,7 +1105,7 @@ static void *session_main(void *arg) {
                     srt_close(srt_out);
                 }
                 srt_out = SRT_INVALID_SOCK;
-                next_output_retry_at_ms = now_ms();
+                next_output_retry_at_ms = now_mono_ms();
                 continue;
             }
             record_stream_forward_progress(state_slot, r);
@@ -1172,6 +1239,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Output URI must use srt://\n");
         return 1;
     }
+    if (!query_passphrase_ok(in_query, "input") || !query_passphrase_ok(out_query, "output")) {
+        return 1;
+    }
 
     relay_config_t cfg;
     memset(&cfg, 0, sizeof cfg);
@@ -1201,7 +1271,12 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    apply_srt_opts(srv, in_query);
+    if (apply_srt_opts(srv, in_query) != 0) {
+        fprintf(stderr, "Failed to apply input SRT options\n");
+        srt_close(srv);
+        srt_cleanup();
+        return 1;
+    }
 
     char in_passphrase[512];
     int in_has_passphrase =
@@ -1214,7 +1289,12 @@ int main(int argc, char *argv[]) {
          * checked explicitly right after accept, below, to require a secured
          * key exchange before a session is started. */
         int enforced = 0;
-        srt_setsockflag(srv, SRTO_ENFORCEDENCRYPTION, &enforced, sizeof enforced);
+        if (set_srt_flag_checked(srv, SRTO_ENFORCEDENCRYPTION, "enforcedencryption", &enforced,
+                                 sizeof enforced) != 0) {
+            srt_close(srv);
+            srt_cleanup();
+            return 1;
+        }
     }
 
     struct sockaddr_in sa;
