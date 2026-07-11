@@ -56,6 +56,9 @@ downstream SRT target.
   `srt_sendmsg2` over the `srt://` output connection. If the downstream SRT
   target is unreachable, the session retries with backoff (1s, 2s, 4s, 8s,
   16s) in the background without dropping the encoder's input connection.
+  If the downstream listener explicitly rejects the stream (for example, an
+  unknown or unauthorized stream ID), the relay closes the input immediately
+  instead of retaining a session that can never publish.
 - **Stats collection.** A per-session sampler (`update_stream_srt_counters`,
   rate-limited to once/sec/session) pulls counters from libsrt
   (`srt_bstats`, `srt_group_data`) under a lock and writes them into the
