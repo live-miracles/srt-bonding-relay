@@ -332,6 +332,8 @@ typedef struct session_args {
     SRTSOCKET conn;
     const relay_config_t *cfg;
     int tracker_slot;
+    char peer_ip[INET6_ADDRSTRLEN];
+    int peer_port;
 } session_args_t;
 
 static long long now_ms(void) {
@@ -929,6 +931,9 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 
     if (srt_connect(srt_out, (struct sockaddr *)&cfg->out_addr, (int)cfg->out_addrlen) ==
         SRT_ERROR) {
+        char out_ip[INET6_ADDRSTRLEN] = "?";
+        int out_port = 0;
+        format_leg_addr(&cfg->out_addr, out_ip, sizeof out_ip, &out_port);
         int error_code = srt_getlasterror(NULL);
         char error_text[256];
         snprintf(error_text, sizeof error_text, "%s", srt_getlasterror_str());
@@ -938,13 +943,18 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 
         if (reject_reason != SRT_REJ_UNKNOWN) {
             const char *reason_text = srt_rejectreason_str(reject_reason);
-            set_last_errorf("srt_connect: %s (reject=%s/%d)", error_text,
+            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s (reject=%s/%d)", out_ip,
+                            out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
                             reason_text ? reason_text : "unknown", reject_reason);
-            fprintf(stderr, "srt_connect: %s (reject=%s/%d)\n", error_text,
+            fprintf(stderr,
+                    "srt_connect failed target=%s:%d streamid=%s error=\"%s\" reject=%s/%d\n",
+                    out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
                     reason_text ? reason_text : "unknown", reject_reason);
         } else {
-            set_last_errorf("srt_connect: %s", error_text);
-            fprintf(stderr, "srt_connect: %s\n", error_text);
+            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
+                            streamid && streamid[0] ? streamid : "(empty)", error_text);
+            fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
+                    out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
         }
         if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
             srt_close(srt_out);
@@ -988,6 +998,8 @@ static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const 
     set_stream_output_connected(state_slot, 0);
     set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
                       delay_ms);
+    fprintf(stderr, "Output publish retry streamid=%s failures=%d retry_ms=%d\n",
+            streamid && streamid[0] ? streamid : "(empty)", failures, delay_ms);
     if (next_retry_at_ms) *next_retry_at_ms = now_ms() + delay_ms;
     return SRT_INVALID_SOCK;
 }
@@ -997,7 +1009,14 @@ static void *session_main(void *arg) {
     SRTSOCKET conn = args->conn;
     const relay_config_t *cfg = args->cfg;
     int tracker_slot = args->tracker_slot;
+    char peer_ip[INET6_ADDRSTRLEN];
+    snprintf(peer_ip, sizeof peer_ip, "%s", args->peer_ip[0] ? args->peer_ip : "?");
+    int peer_port = args->peer_port;
     free(args);
+    long long started_at_ms = now_ms();
+    long long bytes_forwarded = 0;
+    long long packets_forwarded = 0;
+    const char *close_reason = "input_disconnected";
 
     char streamid[1024];
     if (!get_streamid(conn, streamid, sizeof streamid)) {
@@ -1007,7 +1026,8 @@ static void *session_main(void *arg) {
     }
     set_tracked_session_streamid(tracker_slot, streamid);
 
-    fprintf(stderr, "Accepted bonded SRT source streamid=%s\n", streamid[0] ? streamid : "(empty)");
+    fprintf(stderr, "Accepted bonded SRT source peer=%s:%d streamid=%s\n", peer_ip, peer_port,
+            streamid[0] ? streamid : "(empty)");
     int state_slot = claim_stream_state(streamid, tracker_slot);
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
@@ -1071,9 +1091,12 @@ static void *session_main(void *arg) {
         if (r == SRT_ERROR) {
             int err = srt_getlasterror(NULL);
             if (err != SRT_ECONNLOST && err != SRT_ENOCONN) {
+                close_reason = "input_error";
                 set_last_errorf("srt_recvmsg2: %s", srt_getlasterror_str());
                 set_stream_errorf(state_slot, "Input error: %s", srt_getlasterror_str());
-                fprintf(stderr, "srt_recvmsg2: %s\n", srt_getlasterror_str());
+                fprintf(stderr, "srt_recvmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
+                        peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
+                        srt_getlasterror_str());
             }
             break;
         }
@@ -1086,7 +1109,9 @@ static void *session_main(void *arg) {
                 set_last_errorf("srt_sendmsg2: %s", srt_getlasterror_str());
                 set_stream_errorf(state_slot, "Relay output error: %s", srt_getlasterror_str());
                 set_stream_output_connected(state_slot, 0);
-                fprintf(stderr, "srt_sendmsg2: %s\n", srt_getlasterror_str());
+                fprintf(stderr, "srt_sendmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
+                        peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
+                        srt_getlasterror_str());
                 if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
                     srt_close(srt_out);
                 }
@@ -1095,21 +1120,29 @@ static void *session_main(void *arg) {
                 continue;
             }
             record_stream_forward_progress(state_slot, r);
+            bytes_forwarded += r;
+            packets_forwarded++;
         }
     }
 
     if (terminal_output_rejection) {
+        close_reason = "output_rejected";
         fprintf(stderr, "Closing input after downstream rejection streamid=%s\n",
                 streamid[0] ? streamid : "(empty)");
     }
 
+    if (!g_running) close_reason = "shutdown";
     update_stream_srt_counters(state_slot, tracker_slot, conn, srt_out, 1);
     if (srt_out != SRT_INVALID_SOCK &&
         take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
         srt_close(srt_out);
     }
     remove_stream_state(state_slot);
-    fprintf(stderr, "Connection closed streamid=%s\n", streamid[0] ? streamid : "(empty)");
+    fprintf(stderr,
+            "Connection closed peer=%s:%d streamid=%s reason=%s duration_ms=%lld "
+            "bytes_forwarded=%lld packets_forwarded=%lld\n",
+            peer_ip, peer_port, streamid[0] ? streamid : "(empty)", close_reason,
+            now_ms() - started_at_ms, bytes_forwarded, packets_forwarded);
 
 cleanup:
     if (take_tracked_input_socket(tracker_slot, conn) != SRT_INVALID_SOCK) {
@@ -1372,6 +1405,7 @@ int main(int argc, char *argv[]) {
             }
             args->conn = conn;
             args->cfg = &cfg;
+            format_leg_addr(&peer, args->peer_ip, sizeof args->peer_ip, &args->peer_port);
             args->tracker_slot = register_session_thread(conn);
             if (args->tracker_slot < 0) {
                 set_last_errorf("Too many active sessions; rejecting connection");
