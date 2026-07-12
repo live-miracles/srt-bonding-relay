@@ -888,9 +888,14 @@ static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz) {
 }
 
 static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid,
-                                    int tracker_slot) {
+                                    int tracker_slot, char *error_out, size_t error_out_sz) {
+    if (error_out && error_out_sz > 0) error_out[0] = '\0';
+
     SRTSOCKET srt_out = srt_create_socket();
     if (srt_out == SRT_INVALID_SOCK) {
+        if (error_out && error_out_sz > 0) {
+            snprintf(error_out, error_out_sz, "srt_create_socket(out): %s", srt_getlasterror_str());
+        }
         set_last_errorf("srt_create_socket(out): %s", srt_getlasterror_str());
         fprintf(stderr, "srt_create_socket(out): %s\n", srt_getlasterror_str());
         return SRT_INVALID_SOCK;
@@ -913,12 +918,39 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
         char out_ip[INET6_ADDRSTRLEN] = "?";
         int out_port = 0;
         format_leg_addr(&cfg->out_addr, out_ip, sizeof out_ip, &out_port);
+        int error_code = srt_getlasterror(NULL);
         char error_text[256];
         snprintf(error_text, sizeof error_text, "%s", srt_getlasterror_str());
-        set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
-                        streamid && streamid[0] ? streamid : "(empty)", error_text);
-        fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
-                out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
+        int reject_reason =
+            error_code == SRT_ECONNREJ ? srt_getrejectreason(srt_out) : SRT_REJ_UNKNOWN;
+        const char *reason_text =
+            reject_reason != SRT_REJ_UNKNOWN ? srt_rejectreason_str(reject_reason) : NULL;
+
+        if (reject_reason != SRT_REJ_UNKNOWN) {
+            if (error_out && error_out_sz > 0) {
+                snprintf(error_out, error_out_sz,
+                         "srt_connect target=%s:%d streamid=%s: %s (reject=%s/%d)", out_ip,
+                         out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
+                         reason_text ? reason_text : "unknown", reject_reason);
+            }
+            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s (reject=%s/%d)", out_ip,
+                            out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
+                            reason_text ? reason_text : "unknown", reject_reason);
+            fprintf(stderr,
+                    "srt_connect failed target=%s:%d streamid=%s error=\"%s\" reject=%s/%d\n",
+                    out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
+                    reason_text ? reason_text : "unknown", reject_reason);
+        } else {
+            if (error_out && error_out_sz > 0) {
+                snprintf(error_out, error_out_sz, "srt_connect target=%s:%d streamid=%s: %s",
+                         out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)",
+                         error_text);
+            }
+            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
+                            streamid && streamid[0] ? streamid : "(empty)", error_text);
+            fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
+                    out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
+        }
         if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
             srt_close(srt_out);
         }
@@ -934,7 +966,9 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const char *streamid,
                                                int state_slot, int tracker_slot,
                                                long long *next_retry_at_ms) {
-    SRTSOCKET srt_out = connect_srt_output(cfg, streamid, tracker_slot);
+    char output_error[512];
+    SRTSOCKET srt_out =
+        connect_srt_output(cfg, streamid, tracker_slot, output_error, sizeof output_error);
     if (srt_out != SRT_INVALID_SOCK) {
         set_stream_output_connected(state_slot, 1);
         if (next_retry_at_ms) *next_retry_at_ms = 0;
@@ -945,8 +979,14 @@ static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const 
     int failures = get_stream_retry_failures(state_slot);
     int delay_ms = get_retry_delay_ms(failures);
     set_stream_output_connected(state_slot, 0);
-    set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
-                      delay_ms);
+    if (output_error[0]) {
+        set_stream_errorf(state_slot,
+                          "Failed to publish to downstream output: %s; retrying in %d ms",
+                          output_error, delay_ms);
+    } else {
+        set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
+                          delay_ms);
+    }
     fprintf(stderr, "Output publish retry streamid=%s failures=%d retry_ms=%d\n",
             streamid && streamid[0] ? streamid : "(empty)", failures, delay_ms);
     if (next_retry_at_ms) *next_retry_at_ms = now_ms() + delay_ms;
