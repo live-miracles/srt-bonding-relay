@@ -887,29 +887,8 @@ static int get_streamid(SRTSOCKET sock, char *sid, size_t sid_sz) {
     return sid_len > 0;
 }
 
-static int is_terminal_output_rejection(int reason) {
-    if (reason >= SRT_REJC_PREDEFINED) return 1;
-
-    switch (reason) {
-    case SRT_REJ_PEER:
-    case SRT_REJ_ROGUE:
-    case SRT_REJ_VERSION:
-    case SRT_REJ_BADSECRET:
-    case SRT_REJ_UNSECURE:
-    case SRT_REJ_MESSAGEAPI:
-    case SRT_REJ_CONGESTION:
-    case SRT_REJ_FILTER:
-    case SRT_REJ_GROUP:
-        return 1;
-    default:
-        return 0;
-    }
-}
-
 static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *streamid,
-                                    int tracker_slot, int *reject_reason_out) {
-    if (reject_reason_out) *reject_reason_out = SRT_REJ_UNKNOWN;
-
+                                    int tracker_slot) {
     SRTSOCKET srt_out = srt_create_socket();
     if (srt_out == SRT_INVALID_SOCK) {
         set_last_errorf("srt_create_socket(out): %s", srt_getlasterror_str());
@@ -934,28 +913,12 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
         char out_ip[INET6_ADDRSTRLEN] = "?";
         int out_port = 0;
         format_leg_addr(&cfg->out_addr, out_ip, sizeof out_ip, &out_port);
-        int error_code = srt_getlasterror(NULL);
         char error_text[256];
         snprintf(error_text, sizeof error_text, "%s", srt_getlasterror_str());
-        int reject_reason =
-            error_code == SRT_ECONNREJ ? srt_getrejectreason(srt_out) : SRT_REJ_UNKNOWN;
-        if (reject_reason_out) *reject_reason_out = reject_reason;
-
-        if (reject_reason != SRT_REJ_UNKNOWN) {
-            const char *reason_text = srt_rejectreason_str(reject_reason);
-            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s (reject=%s/%d)", out_ip,
-                            out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
-                            reason_text ? reason_text : "unknown", reject_reason);
-            fprintf(stderr,
-                    "srt_connect failed target=%s:%d streamid=%s error=\"%s\" reject=%s/%d\n",
-                    out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
-                    reason_text ? reason_text : "unknown", reject_reason);
-        } else {
-            set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
-                            streamid && streamid[0] ? streamid : "(empty)", error_text);
-            fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
-                    out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
-        }
+        set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
+                        streamid && streamid[0] ? streamid : "(empty)", error_text);
+        fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
+                out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
         if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
             srt_close(srt_out);
         }
@@ -970,26 +933,12 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
 
 static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const char *streamid,
                                                int state_slot, int tracker_slot,
-                                               long long *next_retry_at_ms,
-                                               int *terminal_rejection_out) {
-    if (terminal_rejection_out) *terminal_rejection_out = 0;
-
-    int reject_reason = SRT_REJ_UNKNOWN;
-    SRTSOCKET srt_out = connect_srt_output(cfg, streamid, tracker_slot, &reject_reason);
+                                               long long *next_retry_at_ms) {
+    SRTSOCKET srt_out = connect_srt_output(cfg, streamid, tracker_slot);
     if (srt_out != SRT_INVALID_SOCK) {
         set_stream_output_connected(state_slot, 1);
         if (next_retry_at_ms) *next_retry_at_ms = 0;
         return srt_out;
-    }
-
-    if (is_terminal_output_rejection(reject_reason)) {
-        const char *reason_text = srt_rejectreason_str(reject_reason);
-        set_stream_output_connected(state_slot, 0);
-        set_stream_errorf(state_slot, "Downstream rejected stream (%s/%d); closing input",
-                          reason_text ? reason_text : "unknown", reject_reason);
-        if (terminal_rejection_out) *terminal_rejection_out = 1;
-        if (next_retry_at_ms) *next_retry_at_ms = 0;
-        return SRT_INVALID_SOCK;
     }
 
     increment_stream_retry_failures(state_slot);
@@ -1031,7 +980,6 @@ static void *session_main(void *arg) {
     int state_slot = claim_stream_state(streamid, tracker_slot);
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
-    int terminal_output_rejection = 0;
 
     if (state_slot == -2) {
         long long deadline = now_ms() + DUPLICATE_TAKEOVER_WAIT_MS;
@@ -1075,15 +1023,13 @@ static void *session_main(void *arg) {
     }
 
     srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
-                                            &next_output_retry_at_ms, &terminal_output_rejection);
+                                            &next_output_retry_at_ms);
 
     char buf[CHUNK];
-    while (g_running && !terminal_output_rejection && stream_input_still_connected(conn)) {
+    while (g_running && stream_input_still_connected(conn)) {
         if (srt_out == SRT_INVALID_SOCK && now_ms() >= next_output_retry_at_ms) {
-            srt_out =
-                connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
-                                              &next_output_retry_at_ms, &terminal_output_rejection);
-            if (terminal_output_rejection) break;
+            srt_out = connect_srt_output_with_retry(cfg, streamid, state_slot, tracker_slot,
+                                                    &next_output_retry_at_ms);
         }
 
         SRT_MSGCTRL mc = srt_msgctrl_default;
@@ -1123,12 +1069,6 @@ static void *session_main(void *arg) {
             bytes_forwarded += r;
             packets_forwarded++;
         }
-    }
-
-    if (terminal_output_rejection) {
-        close_reason = "output_rejected";
-        fprintf(stderr, "Closing input after downstream rejection streamid=%s\n",
-                streamid[0] ? streamid : "(empty)");
     }
 
     if (!g_running) close_reason = "shutdown";
