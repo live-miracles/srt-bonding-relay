@@ -1294,20 +1294,6 @@ int main(int argc, char *argv[]) {
 
     apply_srt_opts(srv, in_query);
 
-    char in_passphrase[512];
-    int in_has_passphrase =
-        get_param(in_query, "passphrase", in_passphrase, sizeof in_passphrase) && in_passphrase[0];
-    if (in_has_passphrase) {
-        /* SRTO_ENFORCEDENCRYPTION defaults to on, which makes SRT reject a
-         * bad-passphrase handshake internally before srt_accept() ever sees
-         * it - so the relay can't log the offending peer for fail2ban.
-         * Disabling it lets the connection complete; SRTO_KMSTATE is then
-         * checked explicitly right after accept, below, to require a secured
-         * key exchange before a session is started. */
-        int enforced = 0;
-        srt_setsockflag(srv, SRTO_ENFORCEDENCRYPTION, &enforced, sizeof enforced);
-    }
-
     struct sockaddr_in sa;
     if (resolve_input_bind_addr(in_host, in_port, &sa) < 0) {
         srt_close(srv);
@@ -1377,23 +1363,6 @@ int main(int argc, char *argv[]) {
                 set_last_errorf("srt_accept: %s", srt_getlasterror_str());
                 fprintf(stderr, "srt_accept: %s\n", srt_getlasterror_str());
                 continue;
-            }
-
-            if (in_has_passphrase) {
-                SRT_KM_STATE kmstate = SRT_KM_S_UNSECURED;
-                int kmlen = (int)sizeof kmstate;
-                if (srt_getsockflag(conn, SRTO_KMSTATE, &kmstate, &kmlen) == SRT_ERROR ||
-                    kmstate != SRT_KM_S_SECURED) {
-                    char peer_ip[INET6_ADDRSTRLEN] = "?";
-                    int peer_port = 0;
-                    format_leg_addr(&peer, peer_ip, sizeof peer_ip, &peer_port);
-                    set_last_errorf("Rejected connection (bad passphrase) from %s:%d", peer_ip,
-                                    peer_port);
-                    fprintf(stderr, "Rejected connection (bad passphrase) from %s:%d\n", peer_ip,
-                            peer_port);
-                    srt_close(conn);
-                    continue;
-                }
             }
 
             session_args_t *args = (session_args_t *)calloc(1, sizeof *args);

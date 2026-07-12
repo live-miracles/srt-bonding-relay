@@ -67,13 +67,6 @@ downstream SRT target.
   already-collected state.
 - **Status HTTP server.** A separate thread serves the JSON status snapshot
   described below on its own port, bound to loopback only.
-- **Bad-passphrase rejection.** When `passphrase` is configured, the relay
-  disables SRT's default `SRTO_ENFORCEDENCRYPTION` on the input listener and
-  instead checks `SRTO_KMSTATE` itself right after `srt_accept()`, closing
-  and logging (with the peer's real IP) any connection that did not complete
-  a secured key exchange, before a session thread is ever spawned for it. See
-  [Bad-passphrase logging](#bad-passphrase-logging) below for why this is
-  necessary and how to wire it into `fail2ban`.
 
 ## Config
 
@@ -110,62 +103,19 @@ to the downstream SRT publish socket automatically.
 
 All config fields are required.
 
-## Bad-passphrase logging
+## Passphrase handling
 
-If `passphrase` is set, every rejected connection attempt is logged to
-stderr in a fixed, greppable format:
+When `passphrase` is set, the relay configures `SRTO_PASSPHRASE` on the input
+listener and output connection, then leaves passphrase validation to libsrt's
+default encrypted-handshake handling.
 
-```text
-Rejected connection (bad passphrase) from 203.0.113.7:51234
-```
-
-This is also surfaced as `lastError` in the [status API](#status--stats-http-api).
-
-```text
-passphrase configured
-        |
-        v
-disable SRT's pre-accept enforced-encryption rejection
-        |
-        v
-srt_accept() returns a socket with the peer address
-        |
-        v
-read SRTO_KMSTATE
-        |
-        +--> SRT_KM_S_SECURED  ----> start session thread
-        |
-        +--> anything else     ----> log peer IP and close socket
-```
-
-**Why this needs special handling.** By default SRT's own
-`SRTO_ENFORCEDENCRYPTION` (on by default, and not something the relay used
-to override) rejects a bad-passphrase handshake *inside the SRT handshake
-itself* — `srt_accept()` simply never returns that connection, so the
-application never learns the peer's address and can't log anything useful.
-When a passphrase is configured, the relay now turns
-`SRTO_ENFORCEDENCRYPTION` off on the input listener and instead checks
-`SRTO_KMSTATE` explicitly right after accepting: unless it comes back
-`SRT_KM_S_SECURED`, the connection is closed immediately — no session
-thread is spawned and no payload is ever read — and the peer's address is
-logged.
-
-This is not a weaker security posture than the SRT default: the socket is
-torn down before any data path is touched, and the peer never gets access
-to a decrypted stream. The only difference is *where* the rejection happens,
-which is what makes it observable.
-
-**fail2ban filter example** (`/etc/fail2ban/filter.d/srt-bonding-relay.conf`):
-
-```ini
-[Definition]
-failregex = ^Rejected connection \(bad passphrase\) from <HOST>:\d+$
-ignoreregex =
-```
-
-Point the corresponding jail's `logpath` at wherever the relay's stderr is
-captured (a redirected log file, or `journalctl` output if run under
-systemd).
+Bad-passphrase callers are rejected by libsrt during the handshake, before
+`srt_accept()` returns a connected socket to the relay. That means the relay
+does not get a peer address for those failed attempts and does not emit a
+relay-owned, fail2ban-ready bad-passphrase log line. Depending on libsrt's
+runtime logging, journald may still capture internal SRT error messages for
+failed handshakes, but they should be treated as diagnostic noise rather than
+a stable security log format.
 
 ## Status / Stats HTTP API
 
