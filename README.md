@@ -54,8 +54,10 @@ downstream SRT target.
 - **Forwarding.** Each session thread reads deduplicated payload off the
   group socket with `srt_recvmsg2` and writes it downstream with
   `srt_sendmsg2` over the `srt://` output connection. If the downstream SRT
-  target is unreachable, the session retries with backoff (1s, 2s, 4s, 8s,
-  16s) in the background without dropping the encoder's input connection.
+  target is unreachable or rejects the publish attempt, the session retries
+  with backoff (1s, 2s, 4s, 8s, 16s) in the background without dropping the
+  encoder's input connection. When libsrt exposes a downstream reject reason,
+  it is included in the stream's `lastError`.
 - **Stats collection.** A per-session sampler (`update_stream_srt_counters`,
   rate-limited to once/sec/session) pulls counters from libsrt
   (`srt_bstats`, `srt_group_data`) under a lock and writes them into the
