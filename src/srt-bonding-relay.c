@@ -1082,8 +1082,8 @@ static void *session_main(void *arg) {
             if (err != SRT_ECONNLOST && err != SRT_ENOCONN) {
                 close_reason = "input_error";
                 set_last_errorf("srt_recvmsg2: %s", srt_getlasterror_str());
-                set_stream_errorf(state_slot, "Input error from peer %s:%d: %s", peer_ip,
-                                  peer_port, srt_getlasterror_str());
+                set_stream_errorf(state_slot, "Input error from peer %s:%d: %s", peer_ip, peer_port,
+                                  srt_getlasterror_str());
                 fprintf(stderr, "srt_recvmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
                         peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
                         srt_getlasterror_str());
