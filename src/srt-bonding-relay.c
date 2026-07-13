@@ -491,10 +491,13 @@ static void set_stream_output_connected(int slot, int connected) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.output_connected = connected;
+    // Deliberately leave last_error/last_error_at_ms in place on reconnect: a
+    // status poller can easily land after a fast reconnect already cleared it,
+    // hiding a real failure that just happened. last_error is superseded by a
+    // newer set_stream_errorf() call, or reset to empty by claim_stream_state()
+    // when the slot is later reused for a fresh session.
     if (connected) {
         g_sessions[slot].state.retry_failures = 0;
-        g_sessions[slot].state.last_error[0] = '\0';
-        g_sessions[slot].state.last_error_at_ms = 0;
     }
     pthread_mutex_unlock(&g_sessions_mu);
 }
@@ -1079,7 +1082,8 @@ static void *session_main(void *arg) {
             if (err != SRT_ECONNLOST && err != SRT_ENOCONN) {
                 close_reason = "input_error";
                 set_last_errorf("srt_recvmsg2: %s", srt_getlasterror_str());
-                set_stream_errorf(state_slot, "Input error: %s", srt_getlasterror_str());
+                set_stream_errorf(state_slot, "Input error from peer %s:%d: %s", peer_ip,
+                                  peer_port, srt_getlasterror_str());
                 fprintf(stderr, "srt_recvmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
                         peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
                         srt_getlasterror_str());
@@ -1092,8 +1096,12 @@ static void *session_main(void *arg) {
 
         if (srt_out != SRT_INVALID_SOCK) {
             if (srt_sendmsg2(srt_out, buf, r, NULL) == SRT_ERROR) {
+                char out_ip[INET6_ADDRSTRLEN] = "?";
+                int out_port = 0;
+                format_leg_addr(&cfg->out_addr, out_ip, sizeof out_ip, &out_port);
                 set_last_errorf("srt_sendmsg2: %s", srt_getlasterror_str());
-                set_stream_errorf(state_slot, "Relay output error: %s", srt_getlasterror_str());
+                set_stream_errorf(state_slot, "Relay output error to %s:%d (input peer %s:%d): %s",
+                                  out_ip, out_port, peer_ip, peer_port, srt_getlasterror_str());
                 set_stream_output_connected(state_slot, 0);
                 fprintf(stderr, "srt_sendmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
                         peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
