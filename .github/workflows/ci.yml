@@ -8,11 +8,17 @@ on:
   pull_request:
 
 jobs:
-  smoke:
-    name: Build and smoke test
+  format:
+    name: Format check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y clang-format
       - run: bash scripts/format.sh check
+
+  smoke:
+    name: Build and smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - run: bash scripts/smoke-test.sh
