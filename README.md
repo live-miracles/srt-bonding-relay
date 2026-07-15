@@ -145,6 +145,10 @@ session threads
 shared session state
 ```
 
+The response body itself is compact (no pretty-printing) since nothing
+requires this JSON to be human-formatted — pipe it through `jq`/`python3 -m
+json.tool` if you want to read it by eye.
+
 Top-level fields:
 
 - `pid`, `startedAtMs`, `updatedAtMs`: process identity and snapshot timing
@@ -158,28 +162,73 @@ Each `streamStates[]` entry:
 - `streamId`, `inputActive`, `outputConnected`, `retryFailures`
 - `forwardedPackets`, `forwardedBytes`, `lastPacketAt`, `lastInputPacketAt`:
   relay-tracked forwarding progress
-- `recvPacketsTotal`, `recvUniquePacketsTotal`, `recvLossTotal`,
-  `recvDropTotal`, `retransTotal`: **group-level** input counters, i.e. SRT's
-  own combined/deduplicated accounting across all bonded legs (`srt_bstats`
-  on the group socket). The relay does not sum these itself.
-- `inputRttMs`: RTT reported for the input group socket as a whole
-- `outputRttMs`, `outputSentPacketsTotal`, `outputSendLossTotal`,
-  `outputSendDropTotal`, `outputRetransTotal`: RTT and send-side counters for
-  the single downstream connection (output is never bonded)
-- `legs`: **per-leg** detail for the bonded input — see below
+- `input`: everything SRT reports about the (possibly bonded) input — see below
+- `output`: everything SRT reports about the single downstream connection
+  (output is never bonded) — see below
 - `lastErrorAt`, `lastError`: most recent per-stream error, if any
 
-`legs[]` is one entry per individual bonded connection currently in (or
-recently in) the input group, read directly from `srt_group_data()` +
-`srt_bstats()` on each member socket — this is real per-leg telemetry from
-libsrt, not something the relay derives or combines:
+`input` fields:
 
-- `ip`, `port`: the leg's peer (encoder-side) address, as seen by the relay
-- `state`: `pending` | `idle` | `running` | `broken`
-- `rttMs`, `recvPacketsTotal`, `recvUniquePacketsTotal`, `recvLossTotal`,
-  `recvDropTotal`, `retransTotal`: stats for that leg only
+- `recvPacketsTotal`, `recvUniquePacketsTotal`, `recvLossTotal`,
+  `recvDropTotal`, `retransTotal`: **group-level** counters, i.e. SRT's own
+  combined/deduplicated accounting across all bonded legs (`srt_bstats` on
+  the group socket). The relay does not sum these itself. `recvPacketsTotal`
+  specifically can be `null`: for a bonded group socket SRT doesn't always
+  populate that particular counter, so it's only reported when SRT marks it
+  valid — `recvUniquePacketsTotal` is the reliable dedup'd total to use for
+  group-level throughput.
+- `rttMs`: RTT reported for the input group socket as a whole
+- `latencyMs`: negotiated SRT buffering latency for the input, i.e. the
+  actual value SRT settled on after the handshake, not just what was
+  requested. For a non-bonded input this comes straight from `srt_bstats`
+  (`msRcvTsbPdDelay`, the same underlying value `SRTO_LATENCY` reports). A
+  bonded group socket's own `srt_bstats` never fills that field in, so for a
+  real bonded input this is derived as the max `latencyMs` across `legs[]`
+  instead (see below) — no extra libsrt call needed either way.
+- `bandwidthMbps`, `recvRateMbps`, `belatedTotal`, `belatedAvgMs`,
+  `undecryptTotal`, `reorderDistance`, `rcvBufMs`: estimated capacity, actual
+  receive rate, packets dropped for arriving past their delivery deadline
+  (count + average lateness), decryption failures, reordering, and
+  receive-buffer occupancy (ms) — all read straight from the same
+  `srt_bstats` call as the fields above. **Only populated for a non-bonded
+  input** (`null` otherwise): like `latencyMs`, a bonded group's own
+  `srt_bstats` never fills these in, and there was no reasonable per-leg
+  aggregation for most of them (unlike latency, where "max across legs" has
+  a clear meaning) — check `legs[]` for the real per-leg numbers on a bonded
+  stream instead.
+- `legs`: one entry per individual bonded connection currently in (or
+  recently in) the input group, read directly from `srt_group_data()` +
+  `srt_bstats()` on each member socket — this is real per-leg telemetry from
+  libsrt, not something the relay derives or combines:
+  - `ip`, `port`: the leg's peer (encoder-side) address, as seen by the relay
+  - `state`: `pending` | `idle` | `running` | `broken`
+  - `rttMs`, `recvPacketsTotal`, `recvUniquePacketsTotal`, `recvLossTotal`,
+    `recvDropTotal`, `retransTotal`: stats for that leg only
+  - `latencyMs`: the negotiated latency for that individual leg's own socket
+    (`msRcvTsbPdDelay` from the member's own `srt_bstats`, not the group), so
+    if an encoder ever negotiates a different value per leg it's visible here
+  - `bandwidthMbps`, `recvRateMbps`, `belatedTotal`, `belatedAvgMs`,
+    `undecryptTotal`, `reorderDistance`, `rcvBufMs`: the same set of extra
+    stats as `input.*` above, but for that leg's own socket specifically —
+    reliably populated per leg even though the group-level `input.*`
+    versions are not
 
-Example response for a stream bonded over two legs:
+`output` fields:
+
+- `sentPacketsTotal`, `sendLossTotal`, `sendDropTotal`, `retransTotal`:
+  send-side counters for the downstream connection
+- `rttMs`: RTT for the downstream connection
+- `latencyMs`: negotiated latency on the downstream `srt://` connection the
+  relay makes to the output (from `srt_bstats`' `msRcvTsbPdDelay`, same value
+  as `input.latencyMs`); the relay's default `build_srt_uri()` requests
+  `latency=200` here vs. `latency=240` on the bonded input listener
+- `bandwidthMbps`, `sendRateMbps`, `undecryptTotal`, `sndBufMs`: capacity,
+  actual send rate, decryption failures, and send-buffer occupancy (ms) —
+  the output socket is never a group, so these are populated after the first
+  successful output stats sample while connected
+
+Example response for a stream bonded over two legs (reformatted here for
+readability — the actual response is one compact line):
 
 ```json
 {
@@ -198,52 +247,80 @@ Example response for a stream bonded over two legs:
       "forwardedBytes": 36848,
       "lastPacketAt": 1783569742530,
       "lastInputPacketAt": 1783569742529,
-      "recvPacketsTotal": null,
-      "recvUniquePacketsTotal": 22,
-      "recvLossTotal": 0,
-      "recvDropTotal": 0,
-      "retransTotal": 0,
-      "inputRttMs": null,
-      "outputRttMs": 0.043,
-      "outputSentPacketsTotal": 21,
-      "outputSendLossTotal": 0,
-      "outputSendDropTotal": 0,
-      "outputRetransTotal": 0,
-      "legs": [
-        {
-          "ip": "10.0.1.20",
-          "port": 51072,
-          "state": "running",
-          "rttMs": 24.6,
-          "recvPacketsTotal": 26,
-          "recvUniquePacketsTotal": 26,
-          "recvLossTotal": 0,
-          "recvDropTotal": 0,
-          "retransTotal": 0
-        },
-        {
-          "ip": "10.0.2.31",
-          "port": 39356,
-          "state": "running",
-          "rttMs": 31.2,
-          "recvPacketsTotal": 25,
-          "recvUniquePacketsTotal": 25,
-          "recvLossTotal": 1,
-          "recvDropTotal": 0,
-          "retransTotal": 0
-        }
-      ],
+      "input": {
+        "recvPacketsTotal": null,
+        "recvUniquePacketsTotal": 22,
+        "recvLossTotal": 0,
+        "recvDropTotal": 0,
+        "retransTotal": 0,
+        "rttMs": null,
+        "latencyMs": 240,
+        "bandwidthMbps": null,
+        "recvRateMbps": null,
+        "belatedTotal": null,
+        "belatedAvgMs": null,
+        "undecryptTotal": null,
+        "reorderDistance": null,
+        "rcvBufMs": null,
+        "legs": [
+          {
+            "ip": "10.0.1.20",
+            "port": 51072,
+            "state": "running",
+            "rttMs": 24.6,
+            "latencyMs": 240,
+            "recvPacketsTotal": 26,
+            "recvUniquePacketsTotal": 26,
+            "recvLossTotal": 0,
+            "recvDropTotal": 0,
+            "retransTotal": 0,
+            "bandwidthMbps": 12.3,
+            "recvRateMbps": 0.47,
+            "belatedTotal": 0,
+            "belatedAvgMs": 0.0,
+            "undecryptTotal": 0,
+            "reorderDistance": 0,
+            "rcvBufMs": 221
+          },
+          {
+            "ip": "10.0.2.31",
+            "port": 39356,
+            "state": "running",
+            "rttMs": 31.2,
+            "latencyMs": 240,
+            "recvPacketsTotal": 25,
+            "recvUniquePacketsTotal": 25,
+            "recvLossTotal": 1,
+            "recvDropTotal": 0,
+            "retransTotal": 0,
+            "bandwidthMbps": 9.8,
+            "recvRateMbps": 0.46,
+            "belatedTotal": 2,
+            "belatedAvgMs": 6.4,
+            "undecryptTotal": 0,
+            "reorderDistance": 1,
+            "rcvBufMs": 235
+          }
+        ]
+      },
+      "output": {
+        "sentPacketsTotal": 21,
+        "sendLossTotal": 0,
+        "sendDropTotal": 0,
+        "retransTotal": 0,
+        "rttMs": 0.043,
+        "latencyMs": 200,
+        "bandwidthMbps": 11.8,
+        "sendRateMbps": 0.42,
+        "undecryptTotal": 0,
+        "sndBufMs": 1
+      },
       "lastErrorAt": 0,
       "lastError": null
     }
   ]
 }
 ```
-
-Note `recvPacketsTotal` (group-level, top of the stream entry) can be `null`:
-for a bonded group socket SRT doesn't always populate that particular
-counter, so it's only reported when SRT marks it valid; `recvUniquePacketsTotal`
-is the reliable dedup'd total to use for group-level throughput.
 
 ## Versioning
 

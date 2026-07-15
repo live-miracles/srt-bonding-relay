@@ -71,6 +71,15 @@ typedef struct relay_leg_state {
     int retrans_total;
     double rtt_ms;
     int rtt_valid;
+    int latency_ms;
+    int latency_valid;
+    double bandwidth_mbps;
+    double recv_rate_mbps;
+    long long belated_total;
+    double belated_avg_ms;
+    int undecrypt_total;
+    int reorder_distance;
+    int rcv_buf_ms;
 } relay_leg_state_t;
 
 typedef struct relay_stream_state {
@@ -90,12 +99,31 @@ typedef struct relay_stream_state {
     int retrans_total;
     double input_rtt_ms;
     int input_rtt_valid;
+    int input_latency_ms;
+    int input_latency_valid;
+    /* Only meaningful for a non-bonded input: CUDTGroup::bstatsSocket() never
+     * populates these for a group socket, so they'd otherwise silently read 0. */
+    int input_extra_stats_valid;
+    double input_bandwidth_mbps;
+    double input_recv_rate_mbps;
+    long long input_belated_total;
+    double input_belated_avg_ms;
+    int input_undecrypt_total;
+    int input_reorder_distance;
+    int input_rcv_buf_ms;
     double output_rtt_ms;
     int output_rtt_valid;
+    int output_latency_ms;
+    int output_latency_valid;
+    int output_extra_stats_valid;
     long long output_sent_packets_total;
     int output_send_loss_total;
     int output_send_drop_total;
     int output_retrans_total;
+    double output_bandwidth_mbps;
+    double output_send_rate_mbps;
+    int output_undecrypt_total;
+    int output_snd_buf_ms;
     relay_leg_state_t legs[MAX_GROUP_MEMBERS];
     int leg_count;
     long long last_stats_at_ms;
@@ -491,6 +519,11 @@ static void set_stream_output_connected(int slot, int connected) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
     g_sessions[slot].state.output_connected = connected;
+    if (!connected) {
+        g_sessions[slot].state.output_rtt_valid = 0;
+        g_sessions[slot].state.output_latency_valid = 0;
+        g_sessions[slot].state.output_extra_stats_valid = 0;
+    }
     // Deliberately leave last_error/last_error_at_ms in place on reconnect: a
     // status poller can easily land after a fast reconnect already cleared it,
     // hiding a real failure that just happened. last_error is superseded by a
@@ -572,6 +605,9 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                        g_sessions[tracker_slot].active.in_use &&
                        g_sessions[tracker_slot].active.output_sock == out_sock;
 
+    int have_in_latency = 0;
+    int in_latency_ms = 0;
+
     if (can_read_in) {
         have_in = srt_bstats(in_sock, &in_stats, 0) != SRT_ERROR;
 
@@ -595,6 +631,10 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                         leg->member_state = members[i].memberstate;
                         leg->stats_valid = have_member_stats;
                         if (have_member_stats) {
+                            /* msRcvTsbPdDelay is the same negotiated latency SRTO_LATENCY
+                             * reports, already present in this bstats call. */
+                            leg->latency_valid = member_stats.msRcvTsbPdDelay > 0;
+                            leg->latency_ms = member_stats.msRcvTsbPdDelay;
                             leg->rtt_ms = member_stats.msRTT;
                             leg->rtt_valid = member_stats.msRTT > 0.0;
                             leg->recv_packets_total = member_stats.pktRecvTotal;
@@ -602,10 +642,28 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                             leg->recv_loss_total = member_stats.pktRcvLossTotal;
                             leg->recv_drop_total = member_stats.pktRcvDropTotal;
                             leg->retrans_total = member_stats.pktRcvRetrans;
+                            leg->bandwidth_mbps = member_stats.mbpsBandwidth;
+                            leg->recv_rate_mbps = member_stats.mbpsRecvRate;
+                            leg->belated_total = member_stats.pktRcvBelated;
+                            leg->belated_avg_ms = member_stats.pktRcvAvgBelatedTime;
+                            leg->undecrypt_total = member_stats.pktRcvUndecryptTotal;
+                            leg->reorder_distance = member_stats.pktReorderDistance;
+                            leg->rcv_buf_ms = member_stats.msRcvBuf;
                         }
                     }
                 }
             }
+
+            /* CUDTGroup::bstatsSocket() never fills in msRcvTsbPdDelay, so derive the
+             * group's negotiated latency from whichever legs actually reported one. */
+            for (int li = 0; li < leg_count; ++li) {
+                if (!legs[li].latency_valid) continue;
+                have_in_latency = 1;
+                in_latency_ms = max_int(in_latency_ms, legs[li].latency_ms);
+            }
+        } else {
+            have_in_latency = have_in && in_stats.msRcvTsbPdDelay > 0;
+            in_latency_ms = in_stats.msRcvTsbPdDelay;
         }
     }
 
@@ -615,6 +673,20 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
     pthread_mutex_unlock(&g_session_threads_mu);
 
     pthread_mutex_lock(&g_sessions_mu);
+    if (can_read_in) {
+        g_sessions[slot].state.input_latency_valid = have_in_latency;
+        if (have_in_latency) g_sessions[slot].state.input_latency_ms = in_latency_ms;
+    }
+    g_sessions[slot].state.input_extra_stats_valid = have_in && !is_group_sock;
+    if (g_sessions[slot].state.input_extra_stats_valid) {
+        g_sessions[slot].state.input_bandwidth_mbps = in_stats.mbpsBandwidth;
+        g_sessions[slot].state.input_recv_rate_mbps = in_stats.mbpsRecvRate;
+        g_sessions[slot].state.input_belated_total = in_stats.pktRcvBelated;
+        g_sessions[slot].state.input_belated_avg_ms = in_stats.pktRcvAvgBelatedTime;
+        g_sessions[slot].state.input_undecrypt_total = in_stats.pktRcvUndecryptTotal;
+        g_sessions[slot].state.input_reorder_distance = in_stats.pktReorderDistance;
+        g_sessions[slot].state.input_rcv_buf_ms = in_stats.msRcvBuf;
+    }
     if (have_in) {
         g_sessions[slot].state.input_rtt_ms = in_stats.msRTT;
         g_sessions[slot].state.input_rtt_valid = in_stats.msRTT > 0.0;
@@ -632,12 +704,21 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
             max_int(g_sessions[slot].state.retrans_total, in_stats.pktRcvRetrans);
     }
     if (have_out) {
+        /* msRcvTsbPdDelay is the same negotiated latency SRTO_LATENCY reports,
+         * already present in this bstats call. */
+        g_sessions[slot].state.output_latency_valid = out_stats.msRcvTsbPdDelay > 0;
+        g_sessions[slot].state.output_latency_ms = out_stats.msRcvTsbPdDelay;
         g_sessions[slot].state.output_rtt_ms = out_stats.msRTT;
         g_sessions[slot].state.output_rtt_valid = out_stats.msRTT > 0.0;
+        g_sessions[slot].state.output_extra_stats_valid = 1;
         g_sessions[slot].state.output_sent_packets_total = out_stats.pktSentTotal;
         g_sessions[slot].state.output_send_loss_total = out_stats.pktSndLossTotal;
         g_sessions[slot].state.output_send_drop_total = out_stats.pktSndDropTotal;
         g_sessions[slot].state.output_retrans_total = out_stats.pktRetransTotal;
+        g_sessions[slot].state.output_bandwidth_mbps = out_stats.mbpsBandwidth;
+        g_sessions[slot].state.output_send_rate_mbps = out_stats.mbpsSendRate;
+        g_sessions[slot].state.output_undecrypt_total = out_stats.pktRcvUndecryptTotal;
+        g_sessions[slot].state.output_snd_buf_ms = out_stats.msSndBuf;
     }
     g_sessions[slot].state.leg_count = leg_count;
     for (int li = 0; li < leg_count; ++li) {
@@ -650,6 +731,70 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
 static int stream_input_still_connected(SRTSOCKET conn) {
     SRT_SOCKSTATUS st = srt_getsockstate(conn);
     return st == SRTS_CONNECTED || st == SRTS_LISTENING || st == SRTS_CONNECTING;
+}
+
+/* Writes ,"<key>: " (no leading comma for the first field in an object),
+ * advancing *first. Callers write the value immediately after. Output is
+ * compact (no pretty-printing) since nothing requires this JSON to be
+ * human-formatted. */
+static void json_key(FILE *f, int *first, const char *key) {
+    fprintf(f, "%s\"%s\":", *first ? "" : ",", key);
+    *first = 0;
+}
+
+static void json_bool(FILE *f, int *first, const char *key, int val) {
+    json_key(f, first, key);
+    fputs(val ? "true" : "false", f);
+}
+
+static void json_str(FILE *f, int *first, const char *key, const char *val) {
+    json_key(f, first, key);
+    if (!val) {
+        fputs("null", f);
+        return;
+    }
+    fputc('"', f);
+    json_write_escaped(f, val);
+    fputc('"', f);
+}
+
+static void json_ll(FILE *f, int *first, const char *key, long long val) {
+    json_key(f, first, key);
+    fprintf(f, "%lld", val);
+}
+
+static void json_int(FILE *f, int *first, const char *key, int val) {
+    json_key(f, first, key);
+    fprintf(f, "%d", val);
+}
+
+static void json_dbl(FILE *f, int *first, const char *key, double val) {
+    json_key(f, first, key);
+    fprintf(f, "%.3f", val);
+}
+
+static void json_ll_opt(FILE *f, int *first, const char *key, int valid, long long val) {
+    json_key(f, first, key);
+    if (valid)
+        fprintf(f, "%lld", val);
+    else
+        fputs("null", f);
+}
+
+static void json_int_opt(FILE *f, int *first, const char *key, int valid, int val) {
+    json_key(f, first, key);
+    if (valid)
+        fprintf(f, "%d", val);
+    else
+        fputs("null", f);
+}
+
+static void json_dbl_opt(FILE *f, int *first, const char *key, int valid, double val) {
+    json_key(f, first, key);
+    if (valid)
+        fprintf(f, "%.3f", val);
+    else
+        fputs("null", f);
 }
 
 static void write_status_response(int client_fd) {
@@ -672,121 +817,128 @@ static void write_status_response(int client_fd) {
         return;
     }
 
-    fprintf(f,
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Cache-Control: no-store\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\n"
-            "  \"pid\": %ld,\n"
-            "  \"startedAtMs\": %lld,\n"
-            "  \"updatedAtMs\": %lld,\n"
-            "  \"lastError\": ",
-            (long)getpid(), g_started_at_ms, updated_at_ms);
-    if (last_error[0]) {
-        fputc('"', f);
-        json_write_escaped(f, last_error);
-        fputs("\",\n", f);
-    } else {
-        fputs("null,\n", f);
-    }
-    fputs("  \"activeStreamIds\": [", f);
+    fputs("HTTP/1.1 200 OK\r\n"
+          "Content-Type: application/json\r\n"
+          "Cache-Control: no-store\r\n"
+          "Connection: close\r\n"
+          "\r\n"
+          "{",
+          f);
 
+    int top_first = 1;
+    json_ll(f, &top_first, "pid", (long long)getpid());
+    json_ll(f, &top_first, "startedAtMs", g_started_at_ms);
+    json_ll(f, &top_first, "updatedAtMs", updated_at_ms);
+    json_str(f, &top_first, "lastError", last_error[0] ? last_error : NULL);
+
+    json_key(f, &top_first, "activeStreamIds");
+    fputc('[', f);
     int first = 1;
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
         if (!states[i].streamid[0] || !states[i].input_active) continue;
-        fprintf(f, "%s\n    \"", first ? "\n" : ",\n");
+        fprintf(f, "%s\"", first ? "" : ",");
         json_write_escaped(f, states[i].streamid);
         fputc('"', f);
         first = 0;
     }
-    fprintf(f, "%s\n  ],\n  \"streamStates\": [", first ? "" : "\n");
+    fputc(']', f);
 
+    json_key(f, &top_first, "streamStates");
+    fputc('[', f);
     first = 1;
     for (int i = 0; i < MAX_ACTIVE_SESSIONS; ++i) {
-        if (!states[i].streamid[0]) continue;
-        fprintf(f, "%s\n    {\n      \"streamId\": \"", first ? "\n" : ",\n");
-        json_write_escaped(f, states[i].streamid);
-        fprintf(f,
-                "\",\n      \"inputActive\": %s,\n      \"outputConnected\": %s,\n      "
-                "\"retryFailures\": %d,\n      \"forwardedPackets\": %lld,\n      "
-                "\"forwardedBytes\": %lld,\n      \"lastPacketAt\": %lld,\n      "
-                "\"lastInputPacketAt\": %lld,\n      \"recvPacketsTotal\": ",
-                states[i].input_active ? "true" : "false",
-                states[i].output_connected ? "true" : "false", states[i].retry_failures,
-                states[i].forwarded_packets, states[i].forwarded_bytes, states[i].last_packet_at_ms,
-                states[i].last_input_packet_at_ms);
-        if (states[i].recv_packets_total_valid) {
-            fprintf(f, "%lld", states[i].recv_packets_total);
-        } else {
-            fputs("null", f);
-        }
-        fprintf(f,
-                ",\n      \"recvUniquePacketsTotal\": %lld,\n      \"recvLossTotal\": %d,\n      "
-                "\"recvDropTotal\": %d,\n      \"retransTotal\": %d,\n      \"inputRttMs\": ",
-                states[i].recv_unique_packets_total, states[i].recv_loss_total,
-                states[i].recv_drop_total, states[i].retrans_total);
-        if (states[i].input_rtt_valid) {
-            fprintf(f, "%.3f", states[i].input_rtt_ms);
-        } else {
-            fputs("null", f);
-        }
-        fputs(",\n      \"outputRttMs\": ", f);
-        if (states[i].output_rtt_valid) {
-            fprintf(f, "%.3f", states[i].output_rtt_ms);
-        } else {
-            fputs("null", f);
-        }
-        fprintf(f,
-                ",\n      \"outputSentPacketsTotal\": %lld,\n      \"outputSendLossTotal\": %d,\n"
-                "      \"outputSendDropTotal\": %d,\n      \"outputRetransTotal\": %d,\n      "
-                "\"legs\": [",
-                states[i].output_sent_packets_total, states[i].output_send_loss_total,
-                states[i].output_send_drop_total, states[i].output_retrans_total);
-
-        int leg_first = 1;
-        for (int j = 0; j < states[i].leg_count; ++j) {
-            const relay_leg_state_t *leg = &states[i].legs[j];
-            fprintf(f, "%s\n        {\n          \"ip\": \"", leg_first ? "\n" : ",\n");
-            json_write_escaped(f, leg->ip);
-            fprintf(f,
-                    "\",\n          \"port\": %d,\n          \"state\": \"%s\",\n          "
-                    "\"rttMs\": ",
-                    leg->port, member_state_str(leg->member_state));
-            if (leg->rtt_valid) {
-                fprintf(f, "%.3f", leg->rtt_ms);
-            } else {
-                fputs("null", f);
-            }
-            fputs(",\n          \"recvPacketsTotal\": ", f);
-            if (leg->stats_valid) {
-                fprintf(f,
-                        "%lld,\n          \"recvUniquePacketsTotal\": %lld,\n          "
-                        "\"recvLossTotal\": %d,\n          \"recvDropTotal\": %d,\n          "
-                        "\"retransTotal\": %d\n        }",
-                        leg->recv_packets_total, leg->recv_unique_packets_total,
-                        leg->recv_loss_total, leg->recv_drop_total, leg->retrans_total);
-            } else {
-                fputs("null,\n          \"recvUniquePacketsTotal\": null,\n          "
-                      "\"recvLossTotal\": null,\n          \"recvDropTotal\": null,\n          "
-                      "\"retransTotal\": null\n        }",
-                      f);
-            }
-            leg_first = 0;
-        }
-        fprintf(f, "%s\n      ],\n      \"lastErrorAt\": %lld,\n      \"lastError\": ",
-                leg_first ? "" : "\n", states[i].last_error_at_ms);
-        if (states[i].last_error[0]) {
-            fputc('"', f);
-            json_write_escaped(f, states[i].last_error);
-            fputs("\"\n    }", f);
-        } else {
-            fputs("null\n    }", f);
-        }
+        const relay_stream_state_t *s = &states[i];
+        if (!s->streamid[0]) continue;
+        fprintf(f, "%s{", first ? "" : ",");
         first = 0;
+
+        int sf = 1;
+        json_str(f, &sf, "streamId", s->streamid);
+        json_bool(f, &sf, "inputActive", s->input_active);
+        json_bool(f, &sf, "outputConnected", s->output_connected);
+        json_int(f, &sf, "retryFailures", s->retry_failures);
+        json_ll(f, &sf, "forwardedPackets", s->forwarded_packets);
+        json_ll(f, &sf, "forwardedBytes", s->forwarded_bytes);
+        json_ll(f, &sf, "lastPacketAt", s->last_packet_at_ms);
+        json_ll(f, &sf, "lastInputPacketAt", s->last_input_packet_at_ms);
+
+        json_key(f, &sf, "input");
+        fputc('{', f);
+        int inf = 1;
+        json_ll_opt(f, &inf, "recvPacketsTotal", s->recv_packets_total_valid,
+                    s->recv_packets_total);
+        json_ll(f, &inf, "recvUniquePacketsTotal", s->recv_unique_packets_total);
+        json_int(f, &inf, "recvLossTotal", s->recv_loss_total);
+        json_int(f, &inf, "recvDropTotal", s->recv_drop_total);
+        json_int(f, &inf, "retransTotal", s->retrans_total);
+        json_dbl_opt(f, &inf, "rttMs", s->input_rtt_valid, s->input_rtt_ms);
+        json_int_opt(f, &inf, "latencyMs", s->input_latency_valid, s->input_latency_ms);
+        json_dbl_opt(f, &inf, "bandwidthMbps", s->input_extra_stats_valid, s->input_bandwidth_mbps);
+        json_dbl_opt(f, &inf, "recvRateMbps", s->input_extra_stats_valid, s->input_recv_rate_mbps);
+        json_ll_opt(f, &inf, "belatedTotal", s->input_extra_stats_valid, s->input_belated_total);
+        json_dbl_opt(f, &inf, "belatedAvgMs", s->input_extra_stats_valid, s->input_belated_avg_ms);
+        json_int_opt(f, &inf, "undecryptTotal", s->input_extra_stats_valid,
+                     s->input_undecrypt_total);
+        json_int_opt(f, &inf, "reorderDistance", s->input_extra_stats_valid,
+                     s->input_reorder_distance);
+        json_int_opt(f, &inf, "rcvBufMs", s->input_extra_stats_valid, s->input_rcv_buf_ms);
+
+        json_key(f, &inf, "legs");
+        fputc('[', f);
+        int leg_first = 1;
+        for (int j = 0; j < s->leg_count; ++j) {
+            const relay_leg_state_t *leg = &s->legs[j];
+            fprintf(f, "%s{", leg_first ? "" : ",");
+            leg_first = 0;
+
+            int lf = 1;
+            json_str(f, &lf, "ip", leg->ip);
+            json_int(f, &lf, "port", leg->port);
+            json_str(f, &lf, "state", member_state_str(leg->member_state));
+            json_dbl_opt(f, &lf, "rttMs", leg->rtt_valid, leg->rtt_ms);
+            json_int_opt(f, &lf, "latencyMs", leg->latency_valid, leg->latency_ms);
+            json_ll_opt(f, &lf, "recvPacketsTotal", leg->stats_valid, leg->recv_packets_total);
+            json_ll_opt(f, &lf, "recvUniquePacketsTotal", leg->stats_valid,
+                        leg->recv_unique_packets_total);
+            json_int_opt(f, &lf, "recvLossTotal", leg->stats_valid, leg->recv_loss_total);
+            json_int_opt(f, &lf, "recvDropTotal", leg->stats_valid, leg->recv_drop_total);
+            json_int_opt(f, &lf, "retransTotal", leg->stats_valid, leg->retrans_total);
+            json_dbl_opt(f, &lf, "bandwidthMbps", leg->stats_valid, leg->bandwidth_mbps);
+            json_dbl_opt(f, &lf, "recvRateMbps", leg->stats_valid, leg->recv_rate_mbps);
+            json_ll_opt(f, &lf, "belatedTotal", leg->stats_valid, leg->belated_total);
+            json_dbl_opt(f, &lf, "belatedAvgMs", leg->stats_valid, leg->belated_avg_ms);
+            json_int_opt(f, &lf, "undecryptTotal", leg->stats_valid, leg->undecrypt_total);
+            json_int_opt(f, &lf, "reorderDistance", leg->stats_valid, leg->reorder_distance);
+            json_int_opt(f, &lf, "rcvBufMs", leg->stats_valid, leg->rcv_buf_ms);
+            fputc('}', f);
+        }
+        fputs("]}", f);
+
+        json_key(f, &sf, "output");
+        fputc('{', f);
+        int outf = 1;
+        json_ll(f, &outf, "sentPacketsTotal", s->output_sent_packets_total);
+        json_int(f, &outf, "sendLossTotal", s->output_send_loss_total);
+        json_int(f, &outf, "sendDropTotal", s->output_send_drop_total);
+        json_int(f, &outf, "retransTotal", s->output_retrans_total);
+        json_dbl_opt(f, &outf, "rttMs", s->output_rtt_valid, s->output_rtt_ms);
+        json_int_opt(f, &outf, "latencyMs", s->output_latency_valid, s->output_latency_ms);
+        json_dbl_opt(f, &outf, "bandwidthMbps", s->output_extra_stats_valid,
+                     s->output_bandwidth_mbps);
+        json_dbl_opt(f, &outf, "sendRateMbps", s->output_extra_stats_valid,
+                     s->output_send_rate_mbps);
+        json_int_opt(f, &outf, "undecryptTotal", s->output_extra_stats_valid,
+                     s->output_undecrypt_total);
+        json_int_opt(f, &outf, "sndBufMs", s->output_extra_stats_valid, s->output_snd_buf_ms);
+        fputc('}', f);
+
+        json_ll(f, &sf, "lastErrorAt", s->last_error_at_ms);
+        json_str(f, &sf, "lastError", s->last_error[0] ? s->last_error : NULL);
+        fputc('}', f);
     }
-    fprintf(f, "%s\n  ]\n}\n", first ? "" : "\n");
+    fputc(']', f);
+
+    fputs("}\n", f);
     fclose(f);
 }
 
