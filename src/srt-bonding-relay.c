@@ -370,6 +370,25 @@ static long long now_ms(void) {
     return (long long)ts.tv_sec * 1000LL + (long long)ts.tv_nsec / 1000000LL;
 }
 
+/* Prefixes every log line with a local-time, millisecond-precision timestamp
+ * (matching SRS's "[2014-05-27 19:21:27.276]" convention) so log output can
+ * be correlated during troubleshooting without relying on the process
+ * supervisor to stamp it. */
+static void relay_logf(const char *fmt, ...) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tm_buf;
+    localtime_r(&ts.tv_sec, &tm_buf);
+    char time_buf[32];
+    strftime(time_buf, sizeof time_buf, "%Y-%m-%d %H:%M:%S", &tm_buf);
+    fprintf(stderr, "[%s.%03ld] ", time_buf, ts.tv_nsec / 1000000);
+
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
 static void json_write_escaped(FILE *f, const char *s) {
     for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
         switch (*p) {
@@ -963,18 +982,18 @@ static void *status_http_main(void *arg) {
 
     if (bind(srv, (struct sockaddr *)&sa, sizeof sa) < 0) {
         set_last_errorf("status bind :%d failed: %s", g_status_port, strerror(errno));
-        fprintf(stderr, "status bind :%d failed: %s\n", g_status_port, strerror(errno));
+        relay_logf("status bind :%d failed: %s\n", g_status_port, strerror(errno));
         close(srv);
         return NULL;
     }
     if (listen(srv, 16) < 0) {
         set_last_errorf("status listen failed: %s", strerror(errno));
-        fprintf(stderr, "status listen failed: %s\n", strerror(errno));
+        relay_logf("status listen failed: %s\n", strerror(errno));
         close(srv);
         return NULL;
     }
 
-    fprintf(stderr, "Status HTTP listening on 127.0.0.1:%d\n", g_status_port);
+    relay_logf("Status HTTP listening on 127.0.0.1:%d\n", g_status_port);
 
     while (g_running) {
         fd_set rfds;
@@ -1052,7 +1071,7 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
             snprintf(error_out, error_out_sz, "srt_create_socket(out): %s", srt_getlasterror_str());
         }
         set_last_errorf("srt_create_socket(out): %s", srt_getlasterror_str());
-        fprintf(stderr, "srt_create_socket(out): %s\n", srt_getlasterror_str());
+        relay_logf("srt_create_socket(out): %s\n", srt_getlasterror_str());
         return SRT_INVALID_SOCK;
     }
     set_tracked_session_output_socket(tracker_slot, srt_out);
@@ -1091,10 +1110,9 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
             set_last_errorf("srt_connect target=%s:%d streamid=%s: %s (reject=%s/%d)", out_ip,
                             out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
                             reason_text ? reason_text : "unknown", reject_reason);
-            fprintf(stderr,
-                    "srt_connect failed target=%s:%d streamid=%s error=\"%s\" reject=%s/%d\n",
-                    out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
-                    reason_text ? reason_text : "unknown", reject_reason);
+            relay_logf("srt_connect failed target=%s:%d streamid=%s error=\"%s\" reject=%s/%d\n",
+                       out_ip, out_port, streamid && streamid[0] ? streamid : "(empty)", error_text,
+                       reason_text ? reason_text : "unknown", reject_reason);
         } else {
             if (error_out && error_out_sz > 0) {
                 snprintf(error_out, error_out_sz, "srt_connect target=%s:%d streamid=%s: %s",
@@ -1103,8 +1121,8 @@ static SRTSOCKET connect_srt_output(const relay_config_t *cfg, const char *strea
             }
             set_last_errorf("srt_connect target=%s:%d streamid=%s: %s", out_ip, out_port,
                             streamid && streamid[0] ? streamid : "(empty)", error_text);
-            fprintf(stderr, "srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
-                    out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
+            relay_logf("srt_connect failed target=%s:%d streamid=%s error=\"%s\"\n", out_ip,
+                       out_port, streamid && streamid[0] ? streamid : "(empty)", error_text);
         }
         if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
             srt_close(srt_out);
@@ -1142,8 +1160,8 @@ static SRTSOCKET connect_srt_output_with_retry(const relay_config_t *cfg, const 
         set_stream_errorf(state_slot, "Failed to publish to downstream output; retrying in %d ms",
                           delay_ms);
     }
-    fprintf(stderr, "Output publish retry streamid=%s failures=%d retry_ms=%d\n",
-            streamid && streamid[0] ? streamid : "(empty)", failures, delay_ms);
+    relay_logf("Output publish retry streamid=%s failures=%d retry_ms=%d\n",
+               streamid && streamid[0] ? streamid : "(empty)", failures, delay_ms);
     if (next_retry_at_ms) *next_retry_at_ms = now_ms() + delay_ms;
     return SRT_INVALID_SOCK;
 }
@@ -1170,8 +1188,8 @@ static void *session_main(void *arg) {
     }
     set_tracked_session_streamid(tracker_slot, streamid);
 
-    fprintf(stderr, "Accepted bonded SRT source peer=%s:%d streamid=%s\n", peer_ip, peer_port,
-            streamid[0] ? streamid : "(empty)");
+    relay_logf("Accepted bonded SRT source peer=%s:%d streamid=%s\n", peer_ip, peer_port,
+               streamid[0] ? streamid : "(empty)");
     int state_slot = claim_stream_state(streamid, tracker_slot);
     SRTSOCKET srt_out = SRT_INVALID_SOCK;
     long long next_output_retry_at_ms = 0;
@@ -1190,8 +1208,7 @@ static void *session_main(void *arg) {
             } else if (input_age_ms >= DUPLICATE_TAKEOVER_STALE_MS) {
                 if (!takeover_started) {
                     set_last_errorf("Duplicate publisher takeover for stale streamid=%s", streamid);
-                    fprintf(stderr, "Duplicate publisher takeover for stale streamid=%s\n",
-                            streamid);
+                    relay_logf("Duplicate publisher takeover for stale streamid=%s\n", streamid);
                     close_tracked_sessions_for_streamid(streamid, tracker_slot);
                     takeover_started = 1;
                 }
@@ -1207,13 +1224,13 @@ static void *session_main(void *arg) {
 
         if (state_slot == -2) {
             set_last_errorf("Duplicate publisher rejected for active streamid=%s", streamid);
-            fprintf(stderr, "Duplicate publisher rejected for active streamid=%s\n", streamid);
+            relay_logf("Duplicate publisher rejected for active streamid=%s\n", streamid);
             goto cleanup;
         }
     }
     if (state_slot < 0 && streamid[0]) {
         set_last_errorf("No stream state slot available for streamid=%s", streamid);
-        fprintf(stderr, "No stream state slot available for streamid=%s\n", streamid);
+        relay_logf("No stream state slot available for streamid=%s\n", streamid);
         goto cleanup;
     }
 
@@ -1236,9 +1253,8 @@ static void *session_main(void *arg) {
                 set_last_errorf("srt_recvmsg2: %s", srt_getlasterror_str());
                 set_stream_errorf(state_slot, "Input error from peer %s:%d: %s", peer_ip, peer_port,
                                   srt_getlasterror_str());
-                fprintf(stderr, "srt_recvmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
-                        peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
-                        srt_getlasterror_str());
+                relay_logf("srt_recvmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n", peer_ip,
+                           peer_port, streamid[0] ? streamid : "(empty)", srt_getlasterror_str());
             }
             break;
         }
@@ -1255,9 +1271,8 @@ static void *session_main(void *arg) {
                 set_stream_errorf(state_slot, "Relay output error to %s:%d (input peer %s:%d): %s",
                                   out_ip, out_port, peer_ip, peer_port, srt_getlasterror_str());
                 set_stream_output_connected(state_slot, 0);
-                fprintf(stderr, "srt_sendmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n",
-                        peer_ip, peer_port, streamid[0] ? streamid : "(empty)",
-                        srt_getlasterror_str());
+                relay_logf("srt_sendmsg2 failed peer=%s:%d streamid=%s error=\"%s\"\n", peer_ip,
+                           peer_port, streamid[0] ? streamid : "(empty)", srt_getlasterror_str());
                 if (take_tracked_output_socket(tracker_slot, srt_out) != SRT_INVALID_SOCK) {
                     srt_close(srt_out);
                 }
@@ -1278,11 +1293,10 @@ static void *session_main(void *arg) {
         srt_close(srt_out);
     }
     remove_stream_state(state_slot);
-    fprintf(stderr,
-            "Connection closed peer=%s:%d streamid=%s reason=%s duration_ms=%lld "
-            "bytes_forwarded=%lld packets_forwarded=%lld\n",
-            peer_ip, peer_port, streamid[0] ? streamid : "(empty)", close_reason,
-            now_ms() - started_at_ms, bytes_forwarded, packets_forwarded);
+    relay_logf("Connection closed peer=%s:%d streamid=%s reason=%s duration_ms=%lld "
+               "bytes_forwarded=%lld packets_forwarded=%lld\n",
+               peer_ip, peer_port, streamid[0] ? streamid : "(empty)", close_reason,
+               now_ms() - started_at_ms, bytes_forwarded, packets_forwarded);
 
 cleanup:
     if (take_tracked_input_socket(tracker_slot, conn) != SRT_INVALID_SOCK) {
@@ -1305,8 +1319,8 @@ static int resolve_ipv4_addr(const char *host, int port, int ai_flags, const cha
     snprintf(portstr, sizeof portstr, "%d", port);
     int rc = getaddrinfo(host, portstr, &hints, &res);
     if (rc != 0 || !res) {
-        fprintf(stderr, "getaddrinfo failed for %s %s:%d: %s\n", context, host, port,
-                rc == 0 ? "no address" : gai_strerror(rc));
+        relay_logf("getaddrinfo failed for %s %s:%d: %s\n", context, host, port,
+                   rc == 0 ? "no address" : gai_strerror(rc));
         return -1;
     }
 
@@ -1361,14 +1375,14 @@ int main(int argc, char *argv[]) {
     if (argc == 2) {
         file_config_t file_cfg;
         if (load_config_file(argv[1], &file_cfg) < 0) {
-            fprintf(stderr, "Bad config file: %s\n", argv[1]);
+            relay_logf("Bad config file: %s\n", argv[1]);
             return 1;
         }
         if (build_srt_uri(input_uri, sizeof input_uri, file_cfg.input_host, file_cfg.input_port,
                           file_cfg.passphrase, 1) != 0 ||
             build_srt_uri(output_uri, sizeof output_uri, file_cfg.output_host, file_cfg.output_port,
                           file_cfg.passphrase, 0) != 0) {
-            fprintf(stderr, "Bad config file: failed to build SRT URI\n");
+            relay_logf("Bad config file: failed to build SRT URI\n");
             return 1;
         }
         if (file_cfg.status_port > 0 && file_cfg.status_port <= 65535) {
@@ -1387,20 +1401,20 @@ int main(int argc, char *argv[]) {
 
     if (parse_uri(input_uri, in_scheme, sizeof in_scheme, in_host, sizeof in_host, &in_port,
                   in_query, sizeof in_query) < 0) {
-        fprintf(stderr, "Bad input URI: %s\n", input_uri);
+        relay_logf("Bad input URI: %s\n", input_uri);
         return 1;
     }
     if (parse_uri(output_uri, out_scheme, sizeof out_scheme, out_host, sizeof out_host, &out_port,
                   out_query, sizeof out_query) < 0) {
-        fprintf(stderr, "Bad output URI: %s\n", output_uri);
+        relay_logf("Bad output URI: %s\n", output_uri);
         return 1;
     }
     if (strcmp(in_scheme, "srt") != 0) {
-        fprintf(stderr, "Input URI must use srt://\n");
+        relay_logf("Input URI must use srt://\n");
         return 1;
     }
     if (strcmp(out_scheme, "srt") != 0) {
-        fprintf(stderr, "Output URI must use srt://\n");
+        relay_logf("Output URI must use srt://\n");
         return 1;
     }
 
@@ -1417,7 +1431,7 @@ int main(int argc, char *argv[]) {
     g_started_at_ms = now_ms();
 
     if (install_signal_handlers() != 0) {
-        fprintf(stderr, "install signal handlers failed: %s\n", strerror(errno));
+        relay_logf("install signal handlers failed: %s\n", strerror(errno));
         return 1;
     }
     init_session_tracking();
@@ -1427,7 +1441,7 @@ int main(int argc, char *argv[]) {
     SRTSOCKET srv = srt_create_socket();
     if (srv == SRT_INVALID_SOCK) {
         set_last_errorf("srt_create_socket: %s", srt_getlasterror_str());
-        fprintf(stderr, "srt_create_socket: %s\n", srt_getlasterror_str());
+        relay_logf("srt_create_socket: %s\n", srt_getlasterror_str());
         srt_cleanup();
         return 1;
     }
@@ -1443,33 +1457,33 @@ int main(int argc, char *argv[]) {
 
     if (srt_bind(srv, (struct sockaddr *)&sa, sizeof sa) == SRT_ERROR) {
         set_last_errorf("srt_bind %s:%d: %s", in_host, in_port, srt_getlasterror_str());
-        fprintf(stderr, "srt_bind %s:%d: %s\n", in_host, in_port, srt_getlasterror_str());
+        relay_logf("srt_bind %s:%d: %s\n", in_host, in_port, srt_getlasterror_str());
         srt_close(srv);
         srt_cleanup();
         return 1;
     }
     if (srt_listen(srv, LISTEN_BACKLOG) == SRT_ERROR) {
         set_last_errorf("srt_listen: %s", srt_getlasterror_str());
-        fprintf(stderr, "srt_listen: %s\n", srt_getlasterror_str());
+        relay_logf("srt_listen: %s\n", srt_getlasterror_str());
         srt_close(srv);
         srt_cleanup();
         return 1;
     }
 
-    fprintf(stderr, "Listening on bonded SRT %s:%d (backlog=%d) -> %s\n", in_host, in_port,
-            LISTEN_BACKLOG, output_uri);
+    relay_logf("Listening on bonded SRT %s:%d (backlog=%d) -> %s\n", in_host, in_port,
+               LISTEN_BACKLOG, output_uri);
 
     pthread_t status_tid;
     int status_thread_started = pthread_create(&status_tid, NULL, status_http_main, NULL) == 0;
     if (!status_thread_started) {
         set_last_errorf("pthread_create(status) failed");
-        fprintf(stderr, "pthread_create(status) failed\n");
+        relay_logf("pthread_create(status) failed\n");
     }
 
     int ep = srt_epoll_create();
     if (ep < 0) {
         set_last_errorf("srt_epoll_create: %s", srt_getlasterror_str());
-        fprintf(stderr, "srt_epoll_create: %s\n", srt_getlasterror_str());
+        relay_logf("srt_epoll_create: %s\n", srt_getlasterror_str());
         srt_close(srv);
         g_running = 0;
         if (status_thread_started) pthread_join(status_tid, NULL);
@@ -1479,7 +1493,7 @@ int main(int argc, char *argv[]) {
     int ep_events = SRT_EPOLL_IN | SRT_EPOLL_ERR;
     if (srt_epoll_add_usock(ep, srv, &ep_events) == SRT_ERROR) {
         set_last_errorf("srt_epoll_add_usock: %s", srt_getlasterror_str());
-        fprintf(stderr, "srt_epoll_add_usock: %s\n", srt_getlasterror_str());
+        relay_logf("srt_epoll_add_usock: %s\n", srt_getlasterror_str());
         srt_epoll_release(ep);
         srt_close(srv);
         g_running = 0;
@@ -1501,14 +1515,14 @@ int main(int argc, char *argv[]) {
             SRTSOCKET conn = srt_accept(srv, (struct sockaddr *)&peer, &plen);
             if (conn == SRT_INVALID_SOCK) {
                 set_last_errorf("srt_accept: %s", srt_getlasterror_str());
-                fprintf(stderr, "srt_accept: %s\n", srt_getlasterror_str());
+                relay_logf("srt_accept: %s\n", srt_getlasterror_str());
                 continue;
             }
 
             session_args_t *args = (session_args_t *)calloc(1, sizeof *args);
             if (!args) {
                 set_last_errorf("calloc(session): %s", strerror(errno));
-                fprintf(stderr, "calloc(session): %s\n", strerror(errno));
+                relay_logf("calloc(session): %s\n", strerror(errno));
                 srt_close(conn);
                 continue;
             }
@@ -1518,7 +1532,7 @@ int main(int argc, char *argv[]) {
             args->tracker_slot = register_session_thread(conn);
             if (args->tracker_slot < 0) {
                 set_last_errorf("Too many active sessions; rejecting connection");
-                fprintf(stderr, "Too many active sessions; rejecting connection\n");
+                relay_logf("Too many active sessions; rejecting connection\n");
                 srt_close(conn);
                 free(args);
                 continue;
@@ -1527,7 +1541,7 @@ int main(int argc, char *argv[]) {
             pthread_t tid;
             if (pthread_create(&tid, NULL, session_main, args) != 0) {
                 set_last_errorf("pthread_create(session) failed");
-                fprintf(stderr, "pthread_create failed\n");
+                relay_logf("pthread_create failed\n");
                 unregister_session_thread(args->tracker_slot);
                 srt_close(conn);
                 free(args);
