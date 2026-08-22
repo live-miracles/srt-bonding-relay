@@ -1,4 +1,4 @@
-# srt-bonding-relay
+# SRT Bonding Relay
 
 Standalone SRT bonding ingress relay. It accepts bonded/redundant SRT groups
 on one listener socket and forwards the deduplicated MPEG-TS payload to a
