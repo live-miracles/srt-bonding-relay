@@ -360,7 +360,19 @@ bash scripts/format.sh
 
 ## GitHub Releases
 
-Build the release asset:
+Releases are published automatically when a tag matching `VERSION` is pushed.
+For example, after updating `VERSION` to `v3.0.3` and committing it:
+
+```bash
+git tag v3.0.3
+git push origin master v3.0.3
+```
+
+The release workflow validates that the tag matches `VERSION`, builds the
+Linux archive with Docker, and creates the GitHub Release with generated notes.
+It requires the tag to use the same `vX.Y.Z` value as `VERSION`.
+
+To build the release asset locally instead:
 
 ```bash
 bash scripts/build-release.sh
@@ -372,19 +384,12 @@ That produces:
 build/srt-bonding-relay-linux-x86_64.tar.gz
 ```
 
-Publish it to GitHub Releases, for example:
-
-```bash
-gh release create "$(cat VERSION)" build/srt-bonding-relay-linux-x86_64.tar.gz \
-  --title "srt-bonding-relay $(cat VERSION)" \
-  --notes "Initial standalone release"
-```
-
 Before a release, update `VERSION` first. The binary version is embedded at
 build time, so changing `VERSION` after the asset is built will not update the
 already-built archive.
 
-If the release already exists:
+If a release already exists, the workflow replaces the archive asset. To do
+that manually:
 
 ```bash
 gh release upload "$(cat VERSION)" build/srt-bonding-relay-linux-x86_64.tar.gz --clobber
