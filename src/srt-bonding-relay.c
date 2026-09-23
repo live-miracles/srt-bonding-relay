@@ -94,8 +94,10 @@ typedef struct relay_stream_state {
     long long recv_packets_total;
     int recv_packets_total_valid;
     long long recv_unique_packets_total;
+    int recv_loss_total_valid;
     int recv_loss_total;
     int recv_drop_total;
+    int retrans_total_valid;
     int retrans_total;
     double input_rtt_ms;
     int input_rtt_valid;
@@ -711,6 +713,11 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
         g_sessions[slot].state.input_rtt_valid = in_stats.msRTT > 0.0;
         g_sessions[slot].state.recv_packets_total_valid =
             !(is_group_sock && in_stats.pktRecvTotal == 0 && in_stats.pktRecvUniqueTotal > 0);
+        /* SRT group sockets only expose unique receive and group-drop
+         * statistics. Loss/retransmission are meaningful per member socket,
+         * but there is no deduplicated group equivalent. */
+        g_sessions[slot].state.recv_loss_total_valid = have_in && !is_group_sock;
+        g_sessions[slot].state.retrans_total_valid = have_in && !is_group_sock;
         g_sessions[slot].state.recv_packets_total =
             max_ll(g_sessions[slot].state.recv_packets_total, in_stats.pktRecvTotal);
         g_sessions[slot].state.recv_unique_packets_total =
@@ -887,9 +894,9 @@ static void write_status_response(int client_fd) {
         json_ll_opt(f, &inf, "recvPacketsTotal", s->recv_packets_total_valid,
                     s->recv_packets_total);
         json_ll(f, &inf, "recvUniquePacketsTotal", s->recv_unique_packets_total);
-        json_int(f, &inf, "recvLossTotal", s->recv_loss_total);
+        json_int_opt(f, &inf, "recvLossTotal", s->recv_loss_total_valid, s->recv_loss_total);
         json_int(f, &inf, "recvDropTotal", s->recv_drop_total);
-        json_int(f, &inf, "retransTotal", s->retrans_total);
+        json_int_opt(f, &inf, "retransTotal", s->retrans_total_valid, s->retrans_total);
         json_dbl_opt(f, &inf, "rttMs", s->input_rtt_valid, s->input_rtt_ms);
         json_int_opt(f, &inf, "latencyMs", s->input_latency_valid, s->input_latency_ms);
         json_dbl_opt(f, &inf, "bandwidthMbps", s->input_extra_stats_valid, s->input_bandwidth_mbps);

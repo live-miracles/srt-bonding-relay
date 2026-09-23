@@ -169,14 +169,15 @@ Each `streamStates[]` entry:
 
 `input` fields:
 
-- `recvPacketsTotal`, `recvUniquePacketsTotal`, `recvLossTotal`,
-  `recvDropTotal`, `retransTotal`: **group-level** counters, i.e. SRT's own
-  combined/deduplicated accounting across all bonded legs (`srt_bstats` on
-  the group socket). The relay does not sum these itself. `recvPacketsTotal`
-  specifically can be `null`: for a bonded group socket SRT doesn't always
-  populate that particular counter, so it's only reported when SRT marks it
-  valid — `recvUniquePacketsTotal` is the reliable dedup'd total to use for
-  group-level throughput.
+- `recvPacketsTotal`, `recvUniquePacketsTotal`, and `recvDropTotal`: group-level
+  counters from SRT's bonded group socket. `recvPacketsTotal`,
+  `recvLossTotal`, and `retransTotal` can be `null`: SRT does not provide a
+  deduplicated group-level loss or receive-retransmission counter, and it does
+  not always populate `recvPacketsTotal` for a group. `recvUniquePacketsTotal`
+  is the reliable deduplicated total for group-level throughput. Use the
+  per-leg values below for loss and retransmission telemetry; the relay does
+  not sum them because that would double-count packets recovered on another
+  leg.
 - `rttMs`: RTT reported for the input group socket as a whole
 - `latencyMs`: negotiated SRT buffering latency for the input, i.e. the
   actual value SRT settled on after the handshake, not just what was
