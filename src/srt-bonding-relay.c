@@ -26,6 +26,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <math.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <pthread.h>
@@ -51,6 +52,10 @@
 #define LAST_ERROR_MAX 512
 #define DUPLICATE_TAKEOVER_WAIT_MS 5000
 #define DUPLICATE_TAKEOVER_STALE_MS 5000
+/* libsrt can expose an uninitialized ~1e16 ms value for this statistic after
+ * packet loss. A live SRT packet cannot be belated by anything remotely close
+ * to this; keep a conservative upper bound at the relay API boundary. */
+#define MAX_REASONABLE_BELATED_AVG_MS 1000000000.0
 
 #ifndef RELAY_VERSION
 #define RELAY_VERSION "dev"
@@ -77,6 +82,7 @@ typedef struct relay_leg_state {
     double recv_rate_mbps;
     long long belated_total;
     double belated_avg_ms;
+    int belated_avg_valid;
     int undecrypt_total;
     int reorder_distance;
     int rcv_buf_ms;
@@ -110,6 +116,7 @@ typedef struct relay_stream_state {
     double input_recv_rate_mbps;
     long long input_belated_total;
     double input_belated_avg_ms;
+    int input_belated_avg_valid;
     int input_undecrypt_total;
     int input_reorder_distance;
     int input_rcv_buf_ms;
@@ -579,6 +586,10 @@ static int get_retry_delay_ms(int failures) {
     return RETRY_DELAYS_MS[idx];
 }
 
+static int valid_belated_avg_ms(double value) {
+    return isfinite(value) && value >= 0.0 && value <= MAX_REASONABLE_BELATED_AVG_MS;
+}
+
 static void record_stream_input_progress(int slot) {
     if (slot < 0 || slot >= MAX_ACTIVE_SESSIONS) return;
     pthread_mutex_lock(&g_sessions_mu);
@@ -667,6 +678,8 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
                             leg->recv_rate_mbps = member_stats.mbpsRecvRate;
                             leg->belated_total = member_stats.pktRcvBelated;
                             leg->belated_avg_ms = member_stats.pktRcvAvgBelatedTime;
+                            leg->belated_avg_valid =
+                                valid_belated_avg_ms(member_stats.pktRcvAvgBelatedTime);
                             leg->undecrypt_total = member_stats.pktRcvUndecryptTotal;
                             leg->reorder_distance = member_stats.pktReorderDistance;
                             leg->rcv_buf_ms = member_stats.msRcvBuf;
@@ -704,6 +717,8 @@ static void update_stream_srt_counters(int slot, int tracker_slot, SRTSOCKET in_
         g_sessions[slot].state.input_recv_rate_mbps = in_stats.mbpsRecvRate;
         g_sessions[slot].state.input_belated_total = in_stats.pktRcvBelated;
         g_sessions[slot].state.input_belated_avg_ms = in_stats.pktRcvAvgBelatedTime;
+        g_sessions[slot].state.input_belated_avg_valid =
+            valid_belated_avg_ms(in_stats.pktRcvAvgBelatedTime);
         g_sessions[slot].state.input_undecrypt_total = in_stats.pktRcvUndecryptTotal;
         g_sessions[slot].state.input_reorder_distance = in_stats.pktReorderDistance;
         g_sessions[slot].state.input_rcv_buf_ms = in_stats.msRcvBuf;
@@ -902,7 +917,9 @@ static void write_status_response(int client_fd) {
         json_dbl_opt(f, &inf, "bandwidthMbps", s->input_extra_stats_valid, s->input_bandwidth_mbps);
         json_dbl_opt(f, &inf, "recvRateMbps", s->input_extra_stats_valid, s->input_recv_rate_mbps);
         json_ll_opt(f, &inf, "belatedTotal", s->input_extra_stats_valid, s->input_belated_total);
-        json_dbl_opt(f, &inf, "belatedAvgMs", s->input_extra_stats_valid, s->input_belated_avg_ms);
+        json_dbl_opt(f, &inf, "belatedAvgMs",
+                     s->input_extra_stats_valid && s->input_belated_avg_valid,
+                     s->input_belated_avg_ms);
         json_int_opt(f, &inf, "undecryptTotal", s->input_extra_stats_valid,
                      s->input_undecrypt_total);
         json_int_opt(f, &inf, "reorderDistance", s->input_extra_stats_valid,
@@ -932,7 +949,8 @@ static void write_status_response(int client_fd) {
             json_dbl_opt(f, &lf, "bandwidthMbps", leg->stats_valid, leg->bandwidth_mbps);
             json_dbl_opt(f, &lf, "recvRateMbps", leg->stats_valid, leg->recv_rate_mbps);
             json_ll_opt(f, &lf, "belatedTotal", leg->stats_valid, leg->belated_total);
-            json_dbl_opt(f, &lf, "belatedAvgMs", leg->stats_valid, leg->belated_avg_ms);
+            json_dbl_opt(f, &lf, "belatedAvgMs", leg->stats_valid && leg->belated_avg_valid,
+                         leg->belated_avg_ms);
             json_int_opt(f, &lf, "undecryptTotal", leg->stats_valid, leg->undecrypt_total);
             json_int_opt(f, &lf, "reorderDistance", leg->stats_valid, leg->reorder_distance);
             json_int_opt(f, &lf, "rcvBufMs", leg->stats_valid, leg->rcv_buf_ms);
