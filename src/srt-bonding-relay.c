@@ -1302,7 +1302,22 @@ static void *session_main(void *arg) {
                     srt_close(srt_out);
                 }
                 srt_out = SRT_INVALID_SOCK;
-                next_output_retry_at_ms = now_ms();
+                // A send failure here almost always means the transport-level
+                // connect succeeded (SRS accepts the SRT handshake) but the
+                // stream was then rejected/torn down by SRS's on_publish hook.
+                // Without backoff, a persistently unauthorized stream key
+                // reconnects and fails again in a tight loop bounded only by
+                // handshake + hook round-trip time (seen in production at
+                // 10-40ms intervals, sustained indefinitely). Route through the
+                // same backoff table connect_srt_output_with_retry() uses for
+                // outright connect failures.
+                increment_stream_retry_failures(state_slot);
+                int send_retry_failures = get_stream_retry_failures(state_slot);
+                int send_retry_delay_ms = get_retry_delay_ms(send_retry_failures);
+                next_output_retry_at_ms = now_ms() + send_retry_delay_ms;
+                relay_logf("Output send retry streamid=%s failures=%d retry_ms=%d\n",
+                           streamid[0] ? streamid : "(empty)", send_retry_failures,
+                           send_retry_delay_ms);
                 continue;
             }
             record_stream_forward_progress(state_slot, r);
