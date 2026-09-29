@@ -66,6 +66,18 @@ downstream SRT target.
   already-collected state.
 - **Status HTTP server.** A separate thread serves the JSON status snapshot
   described below on its own port, bound to loopback only.
+- **Bounded logging.** libsrt's own internal log level is set to `LOG_ERR`
+  at startup, so its per-packet diagnostic chatter (e.g. receive-queue
+  pressure warnings under sustained loss/reordering) is never formatted or
+  emitted in the first place. A custom log handler (`srt_log_handler`) is
+  installed as a backstop on top of that: a flat cap of 20 lines/second
+  across the whole process, regardless of level or message, with a one-line
+  "N more suppressed" summary when the cap is hit. This exists because a
+  receive-queue backlog once produced ~35 log lines/sec for 16 minutes,
+  which was enough CPU/IO load on a small host to starve `systemd-journald`
+  and take the whole machine's SSH/networking down with it — the cap makes
+  that failure mode structurally impossible regardless of what triggers a
+  future logging burst.
 
 ## Config
 
